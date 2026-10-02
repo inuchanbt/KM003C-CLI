@@ -95,6 +95,8 @@ PD 応答に含まれる電圧・電流も保存するには `--scope`、その�
 
 Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 名>.metadata.json` も保存します。オフライン変換は CSV、records JSONL、metadata、summary と、指定時の scope CSV を生成します。CY4500 の `.ccgx3` は生成しません。
 
+`0x05` など未知の PD イベントフラグが来ても、キャプチャ・オフライン変換は停止しません。`UNKNOWN_PD_EVENT_0xNN` として表示し、その論理ペイロードの残りを `.records.jsonl` のイベントの `raw_hex` に保持して、次の論理パケット・応答から解析を再開します。未知部分の中でイベント境界を推測しません。CSV の時刻は PD ステータスプリアンブルの観測時刻で、JSONL の `timestamp_source: pd_status_preamble_ms` に出所を記録します。サマリー・メタデータには未知イベント件数を記録します。既知形式のデータ欠落は引き続き framing error とし、`--allow-framing-errors` を指定すると生データを残して読み飛ばします。
+
 ### 単位と時刻
 
 - **PD CSV の `Vbus(V)` は整数の mV** です。現行 CY4500 Utility 形式に合わせています。Scope CSV の `Vbus(V)` と Live CSV の `vbus_V` は V です。

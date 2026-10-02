@@ -95,6 +95,8 @@ Options follow the command: `--transport auto|hid|usb|cdc`, `--serial`, `--vid`,
 
 Live-status CSV has CY4500's 18 columns. Standalone `scope` also writes `<CSV filename>.metadata.json`. Offline export produces CSV, records JSONL, metadata, summary, and optional scope CSV. It does not produce CY4500 `.ccgx3` files.
 
+Unknown PD event flags (including `0x05`) do not stop capture or offline export. They appear as `UNKNOWN_PD_EVENT_0xNN`; the rest of that logical payload is preserved in the event's `raw_hex` in `.records.jsonl`, and decoding resumes at the next logical packet/response. No event boundaries are guessed inside the unknown remainder. Its CSV time is the PD status preamble's observation time, identified by `timestamp_source: pd_status_preamble_ms` in JSONL. Summary/metadata include an unknown-event count. Truncated known formats remain framing errors; `--allow-framing-errors` optionally skips them while retaining raw evidence.
+
 ### Units and timestamps
 
 - **PD CSV's `Vbus(V)` contains integer mV**, matching the current CY4500 Utility layout. Scope CSV's `Vbus(V)` and live CSV's `vbus_V` contain V.

@@ -23,7 +23,7 @@ from km003c_modules.protocol import (
 )
 from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 
 
 def positive_float(text):
@@ -495,7 +495,7 @@ class CaptureExport:
         self.scope_raw = (open_output(stack, self.prefix.with_suffix('.scope.xfers.bin'), binary=True)
                           if live and args.scope and args.scope_raw else None)
         self.clock = ClockUnwrapper()
-        self.frames = self.events = self.samples = self.errors = 0
+        self.frames = self.events = self.samples = self.errors = self.unknown_events = 0
         self.messages = Counter()
 
     def transfer(self, raw):
@@ -534,6 +534,8 @@ class CaptureExport:
                     self.scope_writer.writerow(sample.scope_row(self.frames, packet_index, 0))
                 for event in events:
                     self.events += 1
+                    if event.kind == 'unknown':
+                        self.unknown_events += 1
                     self.messages[event.message] += 1
                     self.pd_writer.writerow(event.csv_row(self.events))
                     record['events'].append(asdict(event))
@@ -554,6 +556,9 @@ class CaptureExport:
         info = metadata(self.args, status=status, error=error, frames=self.frames,
                         events=self.events, scope_samples=self.samples,
                         framing_errors=self.errors, message_counts=dict(self.messages),
+                        unknown_pd_events=self.unknown_events,
+                        unknown_pd_policy='preserve the remaining logical payload; resume at the next logical packet/response',
+                        unknown_pd_timestamp='PD status preamble observation time; unknown event timestamp is not decoded',
                         clock_source='device_ms', timestamp_unit='us converted from device ms',
                         timestamp_resolution_us=1000, crc_eop_status='not exposed',
                         duration_delta='wire duration and inter-packet gap are not exposed; cells are empty',
@@ -564,6 +569,7 @@ class CaptureExport:
         summary = [f'KM003C CLI {VERSION}', f'Status: {status}', f'Native frames: {self.frames}',
                    f'PD/status events: {self.events}', f'Scope samples: {self.samples}',
                    f'Framing errors: {self.errors}', 'Clock: device milliseconds converted to microseconds',
+                   f'Unknown PD event payloads: {self.unknown_events}',
                    'CRC/EOP, wire duration and delta: not exposed',
                    'Start Time == End Time: one observed event timestamp, not physical wire start/end',
                    'Native binary: u32le length followed by native KM003C response, repeated',

@@ -122,6 +122,29 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(events[0].timestamp_us, ((1 << 24) + 122) * 1000)
         self.assertEqual(events[0].message, 'CONNECT')
 
+    def test_unknown_pd_flag_preserves_tail_without_guessing_boundaries(self):
+        payload = pd_payload(ts=2000)
+        unknown = bytes.fromhex('05 c7 07 00 00 04')
+        following = pd_payload(ts=2001)[12:]
+        sample, events = proto.decode_pd(payload + unknown + following, proto.ClockUnwrapper())
+        self.assertEqual([event.kind for event in events], ['pd', 'unknown'])
+        event = events[1]
+        self.assertEqual(event.message, 'UNKNOWN_PD_EVENT_0x05')
+        self.assertEqual(event.flag, 5)
+        self.assertEqual(event.raw_hex, (unknown + following).hex(' '))
+        self.assertEqual(event.timestamp_us, sample.timestamp_us)
+        self.assertEqual(event.timestamp_source, 'pd_status_preamble_ms')
+        self.assertIsNone(event.header)
+
+    def test_unknown_short_tail_is_opaque_but_known_truncation_fails(self):
+        preamble = pd_payload()[:12]
+        for tail in (b'\x05', b'\x05\x01', b'\x46\x00'):
+            _, events = proto.decode_pd(preamble + tail, proto.ClockUnwrapper())
+            self.assertEqual(events[0].kind, 'unknown')
+            self.assertEqual(events[0].raw_hex, tail.hex(' '))
+        with self.assertRaises(proto.ProtocolError):
+            proto.decode_pd(preamble + b'\x45\x01', proto.ClockUnwrapper())
+
     def test_clock_rollover_and_small_backwards_jump(self):
         clock = proto.ClockUnwrapper()
         self.assertEqual(clock.unwrap(0xFFFFFFF0), 0xFFFFFFF0)
@@ -292,6 +315,35 @@ class CliTests(unittest.TestCase):
             self.assertIn('decode_error', evidence)
             self.assertEqual(evidence['raw'], bad.hex(' '))
             self.assertEqual(export.events, 0)
+
+    def test_continuous_capture_survives_unknown_pd_event_and_saves_scope(self):
+        unknown = bytes.fromhex('05 c7 07 00 00 04')
+        first = frame(proto.PD_PACKET, pd_payload(ts=2000) + unknown)
+        second = frame(proto.PD_PACKET, pd_payload(ts=2100))
+        with tempfile.TemporaryDirectory() as folder:
+            prefix = Path(folder) / 'session'
+            args = cli.build_arg_parser().parse_args([
+                'capture', '--until-ctrl-c', '--scope', '--quiet', '--interval', '0',
+                '--out-prefix', str(prefix)])
+            with patch.object(cli, 'Meter') as meter_class, redirect_stdout(io.StringIO()):
+                meter_class.return_value.__enter__.return_value.get_data.side_effect = [
+                    first, second, KeyboardInterrupt()]
+                self.assertEqual(cli.run_capture(args), 0)
+            with prefix.with_suffix('.csv').open(encoding='utf-8-sig') as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row['Message'] for row in rows], [
+                'ACCEPT', 'UNKNOWN_PD_EVENT_0x05', 'ACCEPT'])
+            records = [json.loads(line) for line in
+                       prefix.with_suffix('.records.jsonl').read_text(encoding='utf-8').splitlines()]
+            self.assertEqual(records[0]['events'][1]['raw_hex'], unknown.hex(' '))
+            self.assertEqual(records[0]['events'][1]['timestamp_source'], 'pd_status_preamble_ms')
+            self.assertNotIn('decode_error', records[0])
+            self.assertEqual(list(cli.read_native(prefix.with_suffix('.records.bin'))), [first, second])
+            info = json.loads(prefix.with_suffix('.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['status'], 'interrupted')
+            self.assertEqual(info['scope_samples'], 2)
+            self.assertEqual(info['unknown_pd_events'], 1)
+            self.assertEqual(info['framing_errors'], 0)
 
     def test_cy4500_schema_matches_local_reference(self):
         reference_root = os.environ.get('CY4500_CLI_ROOT')

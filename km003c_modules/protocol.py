@@ -222,6 +222,8 @@ class PdEvent:
     code: int | None = None
     objects: list[int] = field(default_factory=list)
     trailer_hex: str = ''
+    flag: int | None = None
+    timestamp_source: str = 'device_event_ms'
 
     def csv_row(self, index: int):
         if self.header is None:
@@ -258,9 +260,17 @@ def decode_pd(payload: bytes, clock: ClockUnwrapper) -> tuple[Measurement, list[
     offset = 12
     events = []
     while offset < len(payload):
+        flag = payload[offset]
+        if flag != 0x45 and not flag & 0x80:
+            # Unknown wrappers have no established length or timestamp layout.
+            # Preserve the remaining logical payload without guessing a boundary;
+            # the next logical packet/response can still be decoded normally.
+            events.append(PdEvent('unknown', ts, reference * 1000, v, i,
+                payload[offset:].hex(' '), message=f'UNKNOWN_PD_EVENT_0x{flag:02X}',
+                flag=flag, timestamp_source='pd_status_preamble_ms'))
+            break
         if len(payload) - offset < 6:
             raise ProtocolError('Truncated PD event wrapper')
-        flag = payload[offset]
         if flag == 0x45:
             raw = payload[offset:offset + 6]
             event_ts = int.from_bytes(raw[1:4], 'little')
@@ -270,8 +280,6 @@ def decode_pd(payload: bytes, clock: ClockUnwrapper) -> tuple[Measurement, list[
                 raw.hex(' '), message={0x21: 'CONNECT', 0x22: 'DISCONNECT'}.get(code, f'EVENT_0x{code:02X}'), code=code))
             offset += 6
             continue
-        if not flag & 0x80:
-            raise ProtocolError(f'Unknown PD event flag 0x{flag:02X}')
         size = (flag & 0x3F) - 5
         if size < 2 or offset + 6 + size > len(payload):
             raise ProtocolError('Truncated or invalid wrapped PD message')
