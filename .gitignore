@@ -1,0 +1,36 @@
+# Python and editor artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+
+# Local-only manufacturer material and measurement sessions
+/local/
+/docs/
+/KM003C HID接口/
+/data/
+/captures/
+
+# Prevent accidentally staging vendor documents, binaries or captured output
+*.doc
+*.docx
+*.pdf
+*.zip
+*.7z
+*.rar
+*.dll
+*.exe
+*.lib
+*.pdb
+*.obj
+*.csv
+*.jsonl
+*.bin
+*.ccgx3
+*.hex.txt
+*.summary.txt
+*.metadata.json
+*.log
