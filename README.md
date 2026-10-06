@@ -33,13 +33,39 @@ Capture continuously until Ctrl+C:
 .\.venv\Scripts\python.exe km003c_cli.py capture --until-ctrl-c --out-prefix captures/pd02
 ```
 
-Add `--scope` to save voltage/current readings from PD status responses, and `--scope-raw` to preserve their input transfers:
+CSV, `.ccgx3`, native logs, and measurements are enabled by default. `--scope` / `--ccgx3` explicitly select the defaults; add `--scope-raw` to preserve measurement input transfers:
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py capture --seconds 10 --scope --scope-raw --out-prefix captures/session01
 ```
 
-Capture defaults to USB vendor interface 0. On Windows this interface must be accessible through WinUSB. Capture does not automatically issue voltage requests or enter a charging protocol. Output directories are created automatically; existing files with the same name are overwritten. Ctrl+C saves data collected so far. Use a prefix without an extension: output suffixes replace any existing extension.
+Capture defaults to USB vendor interface 0. On Windows this interface must be accessible through WinUSB. Capture does not automatically issue voltage requests or enter a charging protocol. Output directories are created automatically. Existing output files are refused before hardware access; use `--force` to overwrite. Ctrl+C saves data collected so far. Use a prefix without an extension: output suffixes replace any existing extension.
+
+## EZ-PD Protocol Analyzer Utility 4.2.0 output
+
+Open the PD `.csv` with **File > Import**, or open the `.ccgx3` session with **File > Open**. Select a PD row to display its details and the session's voltage/current/CC waveforms when measurements are enabled. CSV imports contain the PD table only; use ccgx3 for waveforms. No Java runtime or manufacturer files are needed to generate either format.
+
+```powershell
+# CY4500-style explicit options; CSV and ccgx3 are enabled by default.
+python km003c_cli.py capture --until-ctrl-c --scope --ccgx3 --out-prefix captures/ezpd01
+
+# Disable waveform and session output, keeping CSV/native logs.
+python km003c_cli.py capture --seconds 10 --no-scope --no-ccgx3 --out-prefix captures/pd_only
+
+# TI-style format selection.
+python km003c_cli.py capture --seconds 10 --formats all --out-prefix captures/all01
+python km003c_cli.py capture --seconds 10 --formats csv ccgx3 --out-prefix captures/gui_only
+
+# Offline conversion of an existing KM003C capture, including its measurements.
+python km003c_cli.py export-gui --records captures/session01.records.bin --out-prefix captures/ezpd_converted
+python km003c_cli.py convert --input captures/session01.records.bin --out-prefix captures/ezpd_converted --force
+```
+
+`capture` and `export-gui` / `convert` / `decode` accept `--scope` / `--no-scope`, `--ccgx3` / `--no-ccgx3`, `--formats all|original|csv|ccgx3` (one or more values), `--force`, and the compatibility alias `--gui-csv`. Defaults are all formats and measurements enabled. Explicit `--[no-]ccgx3` overrides `--formats` for that format. `--formats original` selects KM003C JSONL/native files and scope CSV; CSV/ccgx3 are selected independently. Metadata and summary are always written. Offline inputs accept `--records` or `--input` and must be KM003C length-prefixed frames, not CY4500 records or TI `.pda`.
+
+GUI CSV/ccgx3 contain observed PD messages with `SOP`, `SOP_PRIME`, `SOP_DPRIME` and `v1`/`v2`/`v3` values. Headerless status/unknown events and unverified SOP kinds are omitted from GUI files and counted in metadata; **default original-format JSONL/native logs retain them**, including raw bytes. GoodCRC messages are retained. Selecting only GUI formats intentionally omits those original logs.
+
+KM003C supplies no CRC/EOP result or wire duration: `Ok`, `Duration`, and `Delta` remain blank, and start/end are the same observed point timestamp. The session's `pktData` is a synthetic GUI decoder adapter, with no OK/CRC/EOP bits asserted; it is not a CY4500 capture. Waveform `GraphData` stores physical mV/mA rounded to integers, including signed current; scope CSV/JSONL retain the full original precision. VBUS is stored as an unsigned 16-bit mV value (up to 65.535 V); CC/current use signed 16-bit fields. Out-of-range values are bounded and counted in `ccgx3_graph_clipped`. The stock 4.2.0 GUI interprets VBUS above 32.767 V as negative; the EPR-modified Build 155 GUI reads it correctly. GUI axis limits may hide negative current. No samples are interpolated or added, and KM003C's 1 ms timestamp resolution / polling rate are unchanged.
 
 ## Measurement and offline conversion
 
@@ -62,11 +88,11 @@ Capture defaults to USB vendor interface 0. On Windows this interface must be ac
 | `usb-info` | `--json`, device enumeration |
 | `live-status` / `volt-amp` | `--count`, `--interval`, `--median`, `--csv`, `--instant` |
 | `scope` | `--seconds` / `--until-ctrl-c`, `--csv`, `--raw`, `--quiet`, `--interval`, `--instant`, `--stream`, `--rate` |
-| `capture` | `--seconds` / `--until-ctrl-c`, `--out-prefix`, `--scope`, `--scope-raw`, `--quiet`, `--interval`, `--allow-framing-errors`, `--gui-csv` |
-| `export-gui` / `decode` | `--records`, `--out-prefix`, `--scope`, `--allow-framing-errors` |
+| `capture` | `--seconds` / `--until-ctrl-c`, `--out-prefix`, `--scope` / `--no-scope`, `--scope-raw`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--quiet`, `--interval`, `--allow-framing-errors`, `--gui-csv` |
+| `export-gui` / `convert` / `decode` | `--records` / `--input`, `--out-prefix`, `--scope` / `--no-scope`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--allow-framing-errors` |
 | `adc` | `--count`, `--interval`, `--csv`, `--jsonl`, `--instant` |
 
-Use `<command> --help` for all options. Utility CSV is always generated by `capture`; `--gui-csv` is accepted for compatibility. `--scope-raw` requires `--scope`. ADC uses device-averaged VBUS/IBUS by default; `--instant` selects instantaneous values.
+Use `<command> --help` for all options. Utility CSV is generated by default by `capture`; `--gui-csv` is accepted for compatibility. `--scope-raw` requires `--scope`. ADC uses device-averaged VBUS/IBUS by default; `--instant` selects instantaneous values.
 
 ## Connections
 
@@ -83,7 +109,8 @@ Options follow the command: `--transport auto|hid|usb|cdc`, `--serial`, `--vid`,
 
 | Suffix | Content |
 | --- | --- |
-| `.csv` | PD/connection events, CY4500 Utility's 15 columns, UTF-8 |
+| `.csv` | PD messages, CY4500 Utility's 15 columns, UTF-8 |
+| `.ccgx3` | EZ-PD 4.2 session ZIP with Java-serialized PD and waveform lists |
 | `.records.jsonl` | Native frames, decoded events/measurements, unknown data, decode errors |
 | `.records.bin` | Length-prefixed KM003C response frames |
 | `.records.hex.txt` | Hexadecimal frame listing |
@@ -93,9 +120,9 @@ Options follow the command: `--transport auto|hid|usb|cdc`, `--serial`, `--vid`,
 | `.summary.txt` | Counts, message statistics, completion status |
 | `.metadata.json` | Connection settings, formats, time sources, resolution, unobserved fields |
 
-Live-status CSV has CY4500's 18 columns. Standalone `scope` also writes `<CSV filename>.metadata.json`. Offline export produces CSV, records JSONL, metadata, summary, and optional scope CSV. It does not produce CY4500 `.ccgx3` files.
+Live-status CSV has CY4500's 18 columns. Standalone `scope` also writes `<CSV filename>.metadata.json`. Offline export produces the selected CSV/ccgx3/records JSONL/scope CSV plus metadata and summary; it does not rewrite native binary input. Waveforms for offline sessions are reconstructed from saved measurement preambles.
 
-Unknown PD event flags (including `0x05`) do not stop capture or offline export. They appear as `UNKNOWN_PD_EVENT_0xNN`; the rest of that logical payload is preserved in the event's `raw_hex` in `.records.jsonl`, and decoding resumes at the next logical packet/response. No event boundaries are guessed inside the unknown remainder. Its CSV time is the PD status preamble's observation time, identified by `timestamp_source: pd_status_preamble_ms` in JSONL. Summary/metadata include an unknown-event count. Truncated known formats remain framing errors; `--allow-framing-errors` optionally skips them while retaining raw evidence.
+Unknown PD event flags (including `0x05`) do not stop capture or offline export. They appear in the console/JSONL as `UNKNOWN_PD_EVENT_0xNN`; the remaining logical payload is preserved in `raw_hex`, and decoding resumes at the next logical packet/response without guessing boundaries. They are omitted from GUI CSV/ccgx3 because they lack an interpretable PD header. Their JSONL timestamp source is `pd_status_preamble_ms`. Summary/metadata include unknown and GUI-omitted counts. Truncated known formats remain framing errors; `--allow-framing-errors` optionally skips them while retaining raw evidence in original-format output.
 
 ### Units and timestamps
 
@@ -160,7 +187,7 @@ These commands send manufacturer ASCII commands through CDC and can change volta
 
 ```text
 km003c_cli.py          CLI entry point and exporters
-km003c_modules/       Protocol decoding and USB/HID/CDC backends
+km003c_modules/       Protocol decoding, USB/HID/CDC backends, GUI session writer
 tests/                Offline protocol, transport, and compatibility tests
 README.md             English documentation
 README.ja.md          Japanese documentation
@@ -181,6 +208,8 @@ $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 
 Tests cover synthetic PD packets, ADC example bytes, fragmented reads, timestamp wraparound, signs/units, offline export, raw evidence on decode errors, and ASCII command generation. Reference tests compare column layouts and run CY4500's read-only CSV loaders; they skip if no reference checkout is supplied.
 
+On 2026-10-06, all 42 tests passed with CY4500 reference checks enabled. Local EZ-PD 4.2.0 Build 155 (EPR mod v1.0p) GUI checks confirmed CSV Import, ccgx3 Open, PD details, and waveforms. The stock 4.2.0 CSV parser accepted all 1,881 PD messages in an existing capture; its Java classes deserialized the session's 1,881 packets and 5,674 waveform samples. All graph values matched scope CSV within integer mV/mA rounding. Those local measurements and manufacturer classes are excluded from Git.
+
 Hardware checks on 2026-10-02 confirmed ADC reading over USB/HID/CDC, USB PD capture, standalone HID scope, and offline replay. HID PD-only requests did not respond on the tested unit. New CDC streaming, electronic loads, and live trigger/voltage changes remain unverified.
 
 Implementation references include manufacturer interface/CDC/PDM documentation and public [KM003C protocol research](https://github.com/okhsunrog/km003c-protocol-research/blob/main/docs/protocol_reference.md) / [PD event format](https://github.com/okhsunrog/km003c-protocol-research/blob/main/docs/features/pd_analysis.md). Public research mainly describes firmware V1.9.9; unknown data is retained as raw bytes. Library references: [HIDAPI](https://trezor.github.io/cython-hidapi/api.html), [pySerial](https://pyserial.readthedocs.io/en/latest/pyserial_api.html).
@@ -188,3 +217,5 @@ Implementation references include manufacturer interface/CDC/PDM documentation a
 ## License
 
 [MIT](LICENSE). Manufacturer material is excluded from this repository.
+
+The Java serialization schema is shared with the MIT-licensed [CY4500 CLI](https://github.com/inuchanbt/cy4500-cli) and sibling TI CLI. Manufacturer classes are used only for local compatibility verification and are not distributed.

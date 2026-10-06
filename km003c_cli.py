@@ -22,8 +22,9 @@ from km003c_modules.protocol import (
     logical_packets, measurement_dict,
 )
 from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices
+from km003c_modules.utility_export import UtilityExport, packet_for_event
 
-VERSION = '0.1.1'
+VERSION = '0.2.0'
 
 
 def positive_float(text):
@@ -100,6 +101,21 @@ def ascii_options(parser):
     parser.add_argument('--response-file', help='save the exact response bytes')
 
 
+def gui_output_options(parser):
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument('--scope', dest='scope', action='store_true', help='include measurements (default)')
+    scope.add_argument('--no-scope', dest='scope', action='store_false', help='omit scope CSV and GUI waveform')
+    parser.set_defaults(scope=True)
+    gui = parser.add_mutually_exclusive_group()
+    gui.add_argument('--ccgx3', dest='ccgx3', action='store_true', default=None,
+                     help='enable EZ-PD 4.2 session export (default)')
+    gui.add_argument('--no-ccgx3', dest='ccgx3', action='store_false', help='disable session export')
+    parser.add_argument('--formats', nargs='+', choices=['all', 'original', 'csv', 'ccgx3'],
+                        help='TI-style output selection; default: all; --[no-]ccgx3 overrides this selection')
+    parser.add_argument('--force', action='store_true', help='overwrite existing outputs (default: refuse collisions)')
+    parser.add_argument('--gui-csv', action='store_true', help='compatibility alias; Utility CSV is the default')
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description='POWER-Z KM003C measurement, PD capture and fast-charge control')
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
@@ -144,18 +160,17 @@ def build_arg_parser():
     connection_options(p)
     duration_options(p, 8.0)
     p.add_argument('--out-prefix', default='km003c_capture')
-    p.add_argument('--scope', action='store_true')
+    gui_output_options(p)
     p.add_argument('--scope-raw', action='store_true')
     p.add_argument('--quiet', action='store_true')
     p.add_argument('--allow-framing-errors', action='store_true')
-    p.add_argument('--gui-csv', action='store_true', help='compatibility alias; Utility CSV is already the default')
     p.add_argument('--interval', type=nonnegative_float, default=0.04, help='PD polling interval in seconds')
     p.set_defaults(func=run_capture)
 
-    p = sub.add_parser('export-gui', aliases=['decode'], help='convert saved native records to Utility CSV offline')
-    p.add_argument('--records', required=True, help='KM003C .records.bin (length-prefixed native frames)')
+    p = sub.add_parser('export-gui', aliases=['decode', 'convert'], help='convert saved native records to Utility CSV/ccgx3 offline')
+    p.add_argument('--records', '--input', required=True, help='KM003C .records.bin (length-prefixed native frames)')
     p.add_argument('--out-prefix', required=True)
-    p.add_argument('--scope', action='store_true', help='also export measurement preambles as scope CSV')
+    gui_output_options(p)
     p.add_argument('--allow-framing-errors', action='store_true')
     p.set_defaults(func=run_export)
 
@@ -477,25 +492,85 @@ def run_scope(args):
     return 0
 
 
+def output_formats(args):
+    formats = set(args.formats or ['all'])
+    if 'all' in formats:
+        formats = {'original', 'csv', 'ccgx3'}
+    if args.ccgx3 is not None:
+        if args.ccgx3:
+            formats.add('ccgx3')
+        else:
+            formats.discard('ccgx3')
+    if not formats:
+        raise ValueError('Select at least one output format')
+    return formats
+
+
+def capture_output_paths(args, *, live):
+    formats = output_formats(args)
+    suffixes = ['.metadata.json', '.summary.txt']
+    if 'csv' in formats:
+        suffixes.append('.csv')
+    if 'ccgx3' in formats:
+        suffixes.append('.ccgx3')
+    if 'original' in formats:
+        suffixes.append('.records.jsonl')
+        if args.scope:
+            suffixes.append('.scope.csv')
+        if live:
+            suffixes.extend(['.records.bin', '.records.hex.txt', '.xfers.bin'])
+            if args.scope and args.scope_raw:
+                suffixes.append('.scope.xfers.bin')
+    prefix = Path(args.out_prefix).expanduser()
+    return [prefix.with_suffix(suffix) for suffix in suffixes]
+
+
+def check_capture_outputs(args, *, live, source=None):
+    for path in capture_output_paths(args, live=live):
+        if source is not None and path.resolve() == source:
+            raise ValueError('Output would overwrite the input records')
+        if path.exists() and (not args.force or path.is_dir()):
+            raise FileExistsError(f'{path} exists; choose another prefix or use --force')
+
+
+def print_capture_outputs(export):
+    if 'csv' in export.formats:
+        print(f'PD CSV: {export.prefix.with_suffix(".csv").resolve()} ({export.gui_events} PD messages)')
+    if 'ccgx3' in export.formats:
+        print(f'CCGX3: {export.prefix.with_suffix(".ccgx3").resolve()} '
+              f'({export.gui_events} PD messages, {export.utility.scope_count} waveform samples)')
+    if export.scope_file:
+        print(f'Scope CSV: {export.prefix.with_suffix(".scope.csv").resolve()} ({export.samples} samples)')
+
+
 class CaptureExport:
     def __init__(self, stack, args, *, live):
         self.args = args
         self.prefix = Path(args.out_prefix).expanduser()
-        self.csv_file = open_output(stack, self.prefix.with_suffix('.csv'), bom=False)
-        self.pd_writer = csv.writer(self.csv_file, lineterminator='\n')
-        self.pd_writer.writerow(PD_COLUMNS)
-        self.jsonl = open_output(stack, self.prefix.with_suffix('.records.jsonl'), bom=False)
-        self.scope_file = open_output(stack, self.prefix.with_suffix('.scope.csv')) if args.scope else None
+        self.formats = output_formats(args)
+        check_capture_outputs(args, live=live)
+        original = 'original' in self.formats
+        self.csv_file = open_output(stack, self.prefix.with_suffix('.csv'), bom=False) if 'csv' in self.formats else None
+        self.pd_writer = csv.writer(self.csv_file, lineterminator='\n') if self.csv_file else None
+        if self.pd_writer:
+            self.pd_writer.writerow(PD_COLUMNS)
+        self.jsonl = open_output(stack, self.prefix.with_suffix('.records.jsonl'), bom=False) if original else None
+        self.scope_file = open_output(stack, self.prefix.with_suffix('.scope.csv')) if args.scope and original else None
         self.scope_writer = csv.writer(self.scope_file) if self.scope_file else None
         if self.scope_writer:
             self.scope_writer.writerow(SCOPE_COLUMNS)
-        self.records = open_output(stack, self.prefix.with_suffix('.records.bin'), binary=True) if live else None
-        self.hex_file = open_output(stack, self.prefix.with_suffix('.records.hex.txt'), bom=False) if live else None
-        self.transfers = open_output(stack, self.prefix.with_suffix('.xfers.bin'), binary=True) if live else None
+        self.records = open_output(stack, self.prefix.with_suffix('.records.bin'), binary=True) if live and original else None
+        self.hex_file = open_output(stack, self.prefix.with_suffix('.records.hex.txt'), bom=False) if live and original else None
+        self.transfers = open_output(stack, self.prefix.with_suffix('.xfers.bin'), binary=True) if live and original else None
         self.scope_raw = (open_output(stack, self.prefix.with_suffix('.scope.xfers.bin'), binary=True)
-                          if live and args.scope and args.scope_raw else None)
+                          if live and original and args.scope and args.scope_raw else None)
+        self.prefix.parent.mkdir(parents=True, exist_ok=True)
+        self.utility = UtilityExport(ccgx3_path=self.prefix.with_suffix('.ccgx3') if 'ccgx3' in self.formats else None)
+        stack.callback(self.utility.close)
         self.clock = ClockUnwrapper()
         self.frames = self.events = self.samples = self.errors = self.unknown_events = 0
+        self.gui_events = 0
+        self.gui_omitted = Counter()
         self.messages = Counter()
 
     def transfer(self, raw):
@@ -529,34 +604,61 @@ class CaptureExport:
                         'attribute': packet.attribute, 'payload': packet.payload.hex(' ')})
             for packet_index, sample, events in decoded:
                 record['measurements'].append(measurement_dict(sample))
-                if self.scope_writer and sample.timestamp_us is not None:
+                if self.args.scope and sample.timestamp_us is not None:
                     self.samples += 1
-                    self.scope_writer.writerow(sample.scope_row(self.frames, packet_index, 0))
+                    if self.scope_writer:
+                        self.scope_writer.writerow(sample.scope_row(self.frames, packet_index, 0))
+                    self.utility.write_scope(sample)
                 for event in events:
                     self.events += 1
                     if event.kind == 'unknown':
                         self.unknown_events += 1
                     self.messages[event.message] += 1
-                    self.pd_writer.writerow(event.csv_row(self.events))
-                    record['events'].append(asdict(event))
+                    adapted = packet_for_event(event, self.gui_events + 1)
+                    exported = adapted is not None and bool(self.formats & {'csv', 'ccgx3'})
+                    if exported:
+                        raw_packet, row = adapted
+                        self.gui_events += 1
+                        if self.pd_writer:
+                            self.pd_writer.writerow(row)
+                        self.utility.write_packet(raw_packet, row)
+                    elif adapted is None:
+                        self.gui_omitted[event.message] += 1
+                    record['events'].append({**asdict(event), 'gui_exported': exported})
                     if not getattr(self.args, 'quiet', True):
                         print(f'{self.events:6d} {event.timestamp_us:12d} us  {event.message}')
         except ProtocolError as exc:
             self.errors += 1
             record['decode_error'] = str(exc)
             if not self.args.allow_framing_errors:
-                json_line(self.jsonl, record)
+                if self.jsonl:
+                    json_line(self.jsonl, record)
                 raise
-        json_line(self.jsonl, record)
-        self.csv_file.flush()
+        if self.jsonl:
+            json_line(self.jsonl, record)
+        if self.csv_file:
+            self.csv_file.flush()
         if self.scope_file:
             self.scope_file.flush()
 
     def finalize(self, status, error=None):
+        archive_error = None
+        try:
+            self.utility.close()
+        except (OSError, ValueError) as exc:
+            archive_error = exc
+            status, error = 'failed', str(exc)
         info = metadata(self.args, status=status, error=error, frames=self.frames,
                         events=self.events, scope_samples=self.samples,
                         framing_errors=self.errors, message_counts=dict(self.messages),
                         unknown_pd_events=self.unknown_events,
+                        output_formats=sorted(self.formats), gui_pd_messages=self.gui_events,
+                        gui_omitted_events=dict(self.gui_omitted),
+                        ccgx3_waveform_samples=self.utility.scope_count,
+                        ccgx3_graph_clipped=self.utility.graph_clipped,
+                        ccgx3_packet_data='synthetic GUI adapter; not native CY4500 records; no OK/CRC/EOP bits asserted',
+                        ccgx3_graph_scaling='GraphData physical mV/mA rounded to integers; signed IBUS; EPR GUI unsigned VBUS',
+                        gui_omitted_policy='status/unknown events have no PD header; retained in original-format JSONL/native records',
                         unknown_pd_policy='preserve the remaining logical payload; resume at the next logical packet/response',
                         unknown_pd_timestamp='PD status preamble observation time; unknown event timestamp is not decoded',
                         clock_source='device_ms', timestamp_unit='us converted from device ms',
@@ -570,6 +672,8 @@ class CaptureExport:
                    f'PD/status events: {self.events}', f'Scope samples: {self.samples}',
                    f'Framing errors: {self.errors}', 'Clock: device milliseconds converted to microseconds',
                    f'Unknown PD event payloads: {self.unknown_events}',
+                   f'GUI PD messages: {self.gui_events}', f'GUI omitted events: {dict(self.gui_omitted)}',
+                   f'CCGX3 waveform samples: {self.utility.scope_count}',
                    'CRC/EOP, wire duration and delta: not exposed',
                    'Start Time == End Time: one observed event timestamp, not physical wire start/end',
                    'Native binary: u32le length followed by native KM003C response, repeated',
@@ -578,10 +682,13 @@ class CaptureExport:
         if error:
             summary.append(f'Error: {error}')
         self.prefix.with_suffix('.summary.txt').write_text('\n'.join(summary) + '\n', encoding='utf-8')
+        if archive_error is not None:
+            raise archive_error
 
 
 def run_capture(args):
     status, error = 'completed', None
+    check_capture_outputs(args, live=True)
     with ExitStack() as stack:
         # Own the connection before replacing output files.
         meter = stack.enter_context(Meter(args))
@@ -601,19 +708,15 @@ def run_capture(args):
             raise
         finally:
             export.finalize(status, error)
-    print(f'PD CSV: {export.prefix.with_suffix(".csv").resolve()} ({export.events} events)')
-    if args.scope:
-        print(f'Scope CSV: {export.prefix.with_suffix(".scope.csv").resolve()} ({export.samples} samples)')
+    print_capture_outputs(export)
     return 0
 
 
 def run_export(args):
     source = Path(args.records).expanduser().resolve()
-    prefix = Path(args.out_prefix).expanduser()
-    outputs = [prefix.with_suffix(suffix).resolve() for suffix in
-               ('.csv', '.scope.csv', '.records.jsonl', '.metadata.json', '.summary.txt')]
-    if source in outputs:
-        raise ValueError('Output would overwrite the input records')
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    check_capture_outputs(args, live=False, source=source)
     status, error = 'completed', None
     with ExitStack() as stack:
         export = CaptureExport(stack, args, live=False)
@@ -625,7 +728,7 @@ def run_export(args):
             raise
         finally:
             export.finalize(status, error)
-    print(f'PD CSV: {prefix.with_suffix(".csv").resolve()} ({export.events} events)')
+    print_capture_outputs(export)
     return 0
 
 

@@ -33,13 +33,39 @@ Ctrl+C までキャプチャする場合：
 .\.venv\Scripts\python.exe km003c_cli.py capture --until-ctrl-c --out-prefix captures/pd02
 ```
 
-PD 応答に含まれる電圧・電流も保存するには `--scope`、その入力転送データも残すには `--scope-raw` を追加します。
+CSV・`.ccgx3`・元データのログ・測定値は既定で保存します。`--scope` / `--ccgx3` は既定動作の明示指定です。測定の入力転送データも残すには `--scope-raw` を追加します。
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py capture --seconds 10 --scope --scope-raw --out-prefix captures/session01
 ```
 
-キャプチャは既定で USB vendor interface 0 を使います。Windows ではこのインターフェースを WinUSB で利用できる必要があります。キャプチャから電圧要求や充電プロトコルへの移行を自動実行することはありません。出力フォルダは自動作成し、同名ファイルは上書きします。Ctrl+C で停止しても、それまでのデータを保存します。`--out-prefix` は既存拡張子を置き換えるため、拡張子なしの名前を使ってください。
+キャプチャは既定で USB vendor interface 0 を使います。Windows ではこのインターフェースを WinUSB で利用できる必要があります。キャプチャから電圧要求や充電プロトコルへの移行を自動実行することはありません。出力フォルダは自動作成します。既存ファイルとの衝突は実機接続前に拒否し、上書きには `--force` が必要です。Ctrl+C で停止しても、それまでのデータを保存します。`--out-prefix` は既存拡張子を置き換えるため、拡張子なしの名前を使ってください。
+
+## EZ-PD Protocol Analyzer Utility 4.2.0 用出力
+
+PD の `.csv` は **File > Import**、`.ccgx3` セッションは **File > Open** で読み込みます。PD の行を選ぶと詳細と、測定有効時には電圧・電流・CC の波形を表示します。CSV の Import は PD 一覧だけなので、波形には ccgx3 を使います。生成に Java やメーカーのファイルは不要です。
+
+```powershell
+# CY4500 形式の明示指定。CSV と ccgx3 は既定で有効。
+python km003c_cli.py capture --until-ctrl-c --scope --ccgx3 --out-prefix captures/ezpd01
+
+# 波形とセッションを省き、CSV・元データのログを保存。
+python km003c_cli.py capture --seconds 10 --no-scope --no-ccgx3 --out-prefix captures/pd_only
+
+# TI 形式の出力選択。
+python km003c_cli.py capture --seconds 10 --formats all --out-prefix captures/all01
+python km003c_cli.py capture --seconds 10 --formats csv ccgx3 --out-prefix captures/gui_only
+
+# 既存の KM003C 記録を、測定値も含めてオフライン変換。
+python km003c_cli.py export-gui --records captures/session01.records.bin --out-prefix captures/ezpd_converted
+python km003c_cli.py convert --input captures/session01.records.bin --out-prefix captures/ezpd_converted --force
+```
+
+`capture` と `export-gui` / `convert` / `decode` は `--scope` / `--no-scope`、`--ccgx3` / `--no-ccgx3`、`--formats all|original|csv|ccgx3`（複数指定可）、`--force`、互換用の `--gui-csv` に対応します。既定は全形式・測定有効です。`--[no-]ccgx3` の明示指定は `--formats` の選択に優先します。`--formats original` は KM003C の JSONL・生データと scope CSV を選び、CSV・ccgx3 は個別に選択します。metadata と summary は常に保存します。オフライン入力は `--records` / `--input` で KM003C の長さ付きフレームを指定し、CY4500 records や TI `.pda` は入力できません。
+
+GUI CSV・ccgx3 は実際に観測した PD メッセージを `SOP`、`SOP_PRIME`、`SOP_DPRIME` と `v1` / `v2` / `v3` の表記で保存します。PD ヘッダーのない状態・未知イベントと未検証の SOP 種別は GUI ファイルから除外し、metadata に件数を記録します。**既定の original 形式の JSONL・生データには元のバイト列を含めて残します。** GoodCRC は保存します。GUI 形式だけを選ぶと元データのログは生成しません。
+
+KM003C に CRC / EOP 判定や物理的な通信時間がないため、`Ok`、`Duration`、`Delta` は空欄、開始・終了は同じ観測時刻です。セッションの `pktData` は GUI デコーダー用に組み立てたデータで、OK / CRC / EOP ビットを立てず、CY4500 の実キャプチャとしては扱いません。波形の `GraphData` は物理値を整数 mV / mA に丸めて保存し、電流の符号も保持します。元の精度の値は scope CSV・JSONL に残します。VBUS は unsigned 16-bit の mV（上限 65.535 V）、CC・電流は signed 16-bit です。範囲外の値は範囲内に収め、`ccgx3_graph_clipped` に件数を記録します。メーカー版 4.2.0 の GUI は 32.767 V を超える VBUS を負数として表示しますが、EPR 改造版 Build 155 は正しく表示します。GUI の軸範囲によって負電流が見えない場合があります。測定点の補間・追加はせず、KM003C の 1 ms 分解能・ポーリング頻度を保持します。
 
 ## 測定とオフライン変換
 
@@ -62,11 +88,11 @@ PD 応答に含まれる電圧・電流も保存するには `--scope`、その�
 | `usb-info` | `--json`、デバイス列挙 |
 | `live-status` / `volt-amp` | `--count`、`--interval`、`--median`、`--csv`、`--instant` |
 | `scope` | `--seconds` / `--until-ctrl-c`、`--csv`、`--raw`、`--quiet`、`--interval`、`--instant`、`--stream`、`--rate` |
-| `capture` | `--seconds` / `--until-ctrl-c`、`--out-prefix`、`--scope`、`--scope-raw`、`--quiet`、`--interval`、`--allow-framing-errors`、`--gui-csv` |
-| `export-gui` / `decode` | `--records`、`--out-prefix`、`--scope`、`--allow-framing-errors` |
+| `capture` | `--seconds` / `--until-ctrl-c`、`--out-prefix`、`--scope` / `--no-scope`、`--scope-raw`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--quiet`、`--interval`、`--allow-framing-errors`、`--gui-csv` |
+| `export-gui` / `convert` / `decode` | `--records` / `--input`、`--out-prefix`、`--scope` / `--no-scope`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--allow-framing-errors` |
 | `adc` | `--count`、`--interval`、`--csv`、`--jsonl`、`--instant` |
 
-全オプションは `<コマンド> --help` で確認できます。`capture` は常に Utility CSV を生成するため、`--gui-csv` は互換用の指定です。`--scope-raw` には `--scope` が必要です。ADC は既定でメーターの平均済み VBUS/IBUS を使い、`--instant` で瞬時値へ切り替えます。
+全オプションは `<コマンド> --help` で確認できます。`capture` は既定で Utility CSV を生成し、`--gui-csv` は互換用の指定です。`--scope-raw` には `--scope` が必要です。ADC は既定でメーターの平均済み VBUS/IBUS を使い、`--instant` で瞬時値へ切り替えます。
 
 ## 接続方法
 
@@ -83,7 +109,8 @@ PD 応答に含まれる電圧・電流も保存するには `--scope`、その�
 
 | 拡張子 | 内容 |
 | --- | --- |
-| `.csv` | PD / 接続イベント。CY4500 Utility と同じ 15 列、UTF-8 |
+| `.csv` | PD メッセージ。CY4500 Utility と同じ 15 列、UTF-8 |
+| `.ccgx3` | PD と波形の Java シリアライズリストを含む EZ-PD 4.2 セッション ZIP |
 | `.records.jsonl` | 生フレーム、イベント・測定値、未知データ、デコードエラー |
 | `.records.bin` | 長さ付き KM003C 応答フレーム |
 | `.records.hex.txt` | フレームの HEX 表示 |
@@ -93,9 +120,9 @@ PD 応答に含まれる電圧・電流も保存するには `--scope`、その�
 | `.summary.txt` | 件数、メッセージ別集計、終了状態 |
 | `.metadata.json` | 接続条件、データ形式、時刻の出所、精度、未観測項目 |
 
-Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 名>.metadata.json` も保存します。オフライン変換は CSV、records JSONL、metadata、summary と、指定時の scope CSV を生成します。CY4500 の `.ccgx3` は生成しません。
+Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 名>.metadata.json` も保存します。オフライン変換は選択した CSV・ccgx3・records JSONL・scope CSV と metadata・summary を生成し、入力の生バイナリは書き換えません。セッションの波形は保存済みの測定プリアンブルから再構成します。
 
-`0x05` など未知の PD イベントフラグが来ても、キャプチャ・オフライン変換は停止しません。`UNKNOWN_PD_EVENT_0xNN` として表示し、その論理ペイロードの残りを `.records.jsonl` のイベントの `raw_hex` に保持して、次の論理パケット・応答から解析を再開します。未知部分の中でイベント境界を推測しません。CSV の時刻は PD ステータスプリアンブルの観測時刻で、JSONL の `timestamp_source: pd_status_preamble_ms` に出所を記録します。サマリー・メタデータには未知イベント件数を記録します。既知形式のデータ欠落は引き続き framing error とし、`--allow-framing-errors` を指定すると生データを残して読み飛ばします。
+`0x05` など未知の PD イベントフラグが来ても、キャプチャ・オフライン変換は停止しません。コンソール・JSONL では `UNKNOWN_PD_EVENT_0xNN` として表示し、残りの論理ペイロードを `raw_hex` に保持します。境界を推測せず次の論理パケット・応答から再開します。PD ヘッダーがないため GUI CSV・ccgx3 からは除外します。JSONL の時刻の出所は `pd_status_preamble_ms` です。サマリー・メタデータには未知イベント・GUI 除外件数を記録します。既知形式のデータ欠落は framing error とし、`--allow-framing-errors` 指定時は original 形式に生データを残して読み飛ばします。
 
 ### 単位と時刻
 
@@ -160,7 +187,7 @@ CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプ
 
 ```text
 km003c_cli.py          CLI 起動ファイルと出力処理
-km003c_modules/       プロトコル解析と USB/HID/CDC 接続処理
+km003c_modules/       プロトコル解析、USB/HID/CDC 接続処理、GUI セッション出力
 tests/                オフラインのプロトコル・接続・互換性テスト
 README.md             英語の説明
 README.ja.md          日本語の説明
@@ -181,6 +208,8 @@ $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 
 合成 PD パケット・ADC の例示バイト列を使い、分割受信、時刻折り返し、符号・単位、再変換、エラー時の生データ保持、ASCII コマンド生成を検証します。参照テストは CY4500 の列構成と読み取り専用 CSV ローダーを使い、参照ソース未指定時はスキップします。
 
+2026-10-06 に CY4500 参照チェックを含む 42 件のテストが通りました。ローカルの EZ-PD 4.2.0 Build 155（EPR 改造版 v1.0p）で CSV Import、ccgx3 Open、PD 詳細、波形を確認しました。メーカー版 4.2.0 の CSV パーサーも既存キャプチャの PD 1,881 件をすべて受理し、メーカーの Java クラスでセッションの PD 1,881 件・波形 5,674 点を読み込めました。全波形の値は整数 mV / mA の丸め幅以内で scope CSV と一致しました。検証用の測定データ・メーカーのクラスは Git に含めません。
+
 2026-10-02 の実機確認では USB/HID/CDC の ADC 読み取り、USB PD キャプチャ、単独の HID scope、オフライン再変換を確認しました。検証した個体では HID の PD-only 要求に応答がありませんでした。新 CDC ストリーム・電子負荷・実際のトリガーや電圧変更は未検証です。
 
 実装にはメーカーのインターフェース・CDC・PDM 資料と、公開の [KM003C protocol research](https://github.com/okhsunrog/km003c-protocol-research/blob/main/docs/protocol_reference.md) / [PD event format](https://github.com/okhsunrog/km003c-protocol-research/blob/main/docs/features/pd_analysis.md) を参照しています。公開解析は主に firmware V1.9.9 に基づくため、未知データは生バイトを保持します。ライブラリ資料：[HIDAPI](https://trezor.github.io/cython-hidapi/api.html)、[pySerial](https://pyserial.readthedocs.io/en/latest/pyserial_api.html)。
@@ -188,3 +217,5 @@ $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 ## ライセンス
 
 [MIT](LICENSE)。メーカー資料はこのリポジトリに含めません。
+
+Java シリアライズ形式は MIT ライセンスの [CY4500 CLI](https://github.com/inuchanbt/cy4500-cli) と同系列の TI CLI に基づきます。メーカーのクラスはローカルでの互換性検証にだけ使い、配布しません。

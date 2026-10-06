@@ -332,11 +332,12 @@ class CliTests(unittest.TestCase):
             with prefix.with_suffix('.csv').open(encoding='utf-8-sig') as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual([row['Message'] for row in rows], [
-                'ACCEPT', 'UNKNOWN_PD_EVENT_0x05', 'ACCEPT'])
+                'ACCEPT', 'ACCEPT'])
             records = [json.loads(line) for line in
                        prefix.with_suffix('.records.jsonl').read_text(encoding='utf-8').splitlines()]
             self.assertEqual(records[0]['events'][1]['raw_hex'], unknown.hex(' '))
             self.assertEqual(records[0]['events'][1]['timestamp_source'], 'pd_status_preamble_ms')
+            self.assertFalse(records[0]['events'][1]['gui_exported'])
             self.assertNotIn('decode_error', records[0])
             self.assertEqual(list(cli.read_native(prefix.with_suffix('.records.bin'))), [first, second])
             info = json.loads(prefix.with_suffix('.metadata.json').read_text(encoding='utf-8'))
