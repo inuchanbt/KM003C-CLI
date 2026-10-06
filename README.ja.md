@@ -27,13 +27,13 @@ KM003C の USB データ・制御用インターフェースを PC へ接続し�
 .\.venv\Scripts\python.exe km003c_cli.py capture --seconds 10 --out-prefix captures/pd01
 ```
 
-Ctrl+C までキャプチャする場合：
+Ctrl+C までキャプチャする場合（既定動作）：
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py capture --until-ctrl-c --out-prefix captures/pd02
 ```
 
-CSV・`.ccgx3`・元データのログ・測定値は既定で保存します。`--scope` / `--ccgx3` は既定動作の明示指定です。測定の入力転送データも残すには `--scope-raw` を追加します。
+`--seconds` を省略すると Ctrl+C まで取得します。`--out-prefix` を省略すると `captures/km003c_<ローカルの年月日_時分秒_マイクロ秒>` を生成します。CSV・`.ccgx3`・元データのログ・測定値は既定で保存します。scope・ccgx3 有効、GoodCRC 表示省略、解析・VBUS 推定・scope 生転送保存・quiet・上書きは無効です。状態表示は既定で 1 秒ごと（`--status-interval 1`）で、`--quiet` はイベント・状態表示を省きます。単独 `scope` の既定の取得時間は 5 秒を維持します。`--scope` / `--ccgx3` は既定動作の明示指定です。測定の入力転送データも残すには `--scope-raw` を追加します。
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py capture --seconds 10 --scope --scope-raw --out-prefix captures/session01
@@ -81,6 +81,38 @@ python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus
 
 時刻はしきい値を超えた最初の測定点で、1 ms のデバイス分解能とポーリング間隔（既定 40 ms）による不確かさがあります。KM003C のハードウェアイベントではなくソフトウェア推定で、測定点の間の変化は見逃す場合があります。コンソールには `[VBUS inferred]` と表示します。選択した GUI 出力には電圧イベント行（`Ok=VBUS_UP/DN`、Utility の `VOLT_PKT` 形式）を追加し、PD メッセージは捏造しません。GUI の行だけでは実機 VBUS イベントと区別できないため、共有時は `.vbus_events.jsonl` と metadata も添付してください。この JSONL は `--formats original` でも必ず生成し、`estimated`・出所・しきい値・測定区間・GUI 行との対応を記録します。metadata の `vbus_event_inference` はしきい値・件数・間隔リセット数を記録し、`gui_pd_messages` は推定を除外、`gui_rows` は推定行を含めます。生フレーム・元の JSONL・測定点・実機 PD 件数は変更しません。
 
+### AVS 遷移解析
+
+```powershell
+# Ctrl+C まで取得。出力名は captures/km003c_<日時> を自動生成。
+python km003c_cli.py capture --analyze-transitions
+
+# 10 秒で終了。VBUS UP/DN 推定は独立した任意機能。
+python km003c_cli.py capture --seconds 10 --analyze-transitions --infer-vbus-events --out-prefix captures/avs01
+
+# 保存済みの生データを、実機なしで再解析。入力は変更しない。
+python km003c_cli.py convert --input captures/avs01.records.bin --analyze-transitions --out-prefix captures/avs_reanalyzed
+
+# 同じ KM003C キャプチャの PD/scope CSV を CY4500 と同じ形式で解析。
+python km003c_cli.py analyze-sync --pd-csv captures/avs01.csv --scope-csv captures/avs01.scope.csv --out-prefix captures/avs_csv
+```
+
+`--analyze-transitions` は既定で無効、scope が必要です。取得終了時（Ctrl+C を含む）またはオフライン変換後に解析します。RDO と選択された EPR AVS PDO を含む `EPR_REQUEST` だけを対象とし、次の要求までの SOP ACCEPT/PS_RDY を対応付け、基準電圧・変化方向と開始点・目標電圧通過・目標帯への整定・観測した平坦部・平均スルーレートを推定します。固定電圧/PPS/SPR-AVS 要求は対象外です。空データや AVS 要求がない記録でも、列名付きのレポートと対象なしの説明を生成します。解析用入力を一時ファイルへ保存するため、どの `--formats` 選択でも使え、生データ・測定値は変更しません。`analyze-sync` には同じ取得のデバイス時刻付き PD/scope CSV が必要です。単独 `scope` のホスト時刻 CSV は対応付けできません。
+
+出力は CY4500 と同じ列名・順序の `.transitions.csv`、`.transitions.txt`、`.transition_summary.csv`、`.transition_summary.txt` です。capture・変換の metadata に設定・解析状態・件数・要求番号の基準を記録します。単独 analyze-sync はテキストレポートに設定を記録します。要約では要求目標と観測した平坦部を別々に示します。CSV の flags に KM003C の点時刻・離散測定・データ不足・中断/失敗を記録します。デバイス分解能は 1 ms、既定ポーリングは 40 ms なので、遅延やスルーレートは推定値であり、速い変化は見逃す場合があります。物理的な USB-PD タイミング規格適合の判定には使えません。測定点や時刻オフセットは捏造しません。長い空きや重複時刻では連続した変化・整定の判定を区切り、安定したデータが足りなければ平坦部・整定の値は空欄にします。要求/PS_RDY の近傍測定が許容間隔より遠ければ、対応電圧を未取得とします。
+
+共通のしきい値・オプション名は CY4500 に揃え、測定頻度に依存する既定値は次のようにします。
+
+| オプション | KM003C の既定値 | CY4500 の既定値 |
+| --- | --- | --- |
+| `--movement-sustain-samples` | 2 | 5 |
+| `--settle-hold-ms` / `--observed-settle-hold-ms` | 80 | 20 |
+| `--settle-max-gap-ms` | 100 | 5 |
+| `--plateau-lookback-ms` | 400 | 150 |
+| `--plateau-min-samples` | 6 | 50 |
+
+その他の既定値は、基準窓/直前除外 100/5 ms、変化しきい値 0.05 V・MAD 係数 6、目標帯 ±1%、観測帯 ±0.5%、平坦部の許容幅 max(0.10 V, 0.25%)、目標との妥当性範囲 10% です。すべて `--help` にある CY4500 と同名のオプションで変更できます。解析設定を変えても機器のポーリングや測定設定は変更しません。
+
 ## 測定とオフライン変換
 
 ```powershell
@@ -102,8 +134,9 @@ python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus
 | `usb-info` | `--json`、デバイス列挙 |
 | `live-status` / `volt-amp` | `--count`、`--interval`、`--median`、`--csv`、`--instant` |
 | `scope` | `--seconds` / `--until-ctrl-c`、`--csv`、`--raw`、`--quiet`、`--interval`、`--instant`、`--stream`、`--rate` |
-| `capture` | `--seconds` / `--until-ctrl-c`、`--out-prefix`、`--scope` / `--no-scope`、`--scope-raw`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--quiet`、`--hide-goodcrc` / `--show-goodcrc`、`--infer-vbus-events`、`--interval`、`--allow-framing-errors`、`--gui-csv` |
-| `export-gui` / `convert` / `decode` | `--records` / `--input`、`--out-prefix`、`--scope` / `--no-scope`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--infer-vbus-events`、`--allow-framing-errors` |
+| `capture` | `--seconds` / `--until-ctrl-c`、`--out-prefix`、`--scope` / `--no-scope`、`--scope-raw`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--quiet`、`--hide-goodcrc` / `--show-goodcrc`、`--infer-vbus-events`、`--analyze-transitions`、`--status-interval`、`--interval`、`--allow-framing-errors`、`--gui-csv` |
+| `export-gui` / `convert` / `decode` | `--records` / `--input`、`--out-prefix`、`--scope` / `--no-scope`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--infer-vbus-events`、`--analyze-transitions`、`--allow-framing-errors` |
+| `analyze-sync` | `--pd-csv`、`--scope-csv`、`--out-prefix`、`--force`、遷移解析オプション |
 | `adc` | `--count`、`--interval`、`--csv`、`--jsonl`、`--instant` |
 
 全オプションは `<コマンド> --help` で確認できます。`capture` は既定で Utility CSV を生成し、`--gui-csv` は互換用の指定です。`--scope-raw` には `--scope` が必要です。ADC は既定でメーターの平均済み VBUS/IBUS を使い、`--instant` で瞬時値へ切り替えます。
@@ -133,6 +166,8 @@ python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus
 | `.scope.xfers.bin` | 測定プリアンブルを含む転送データ。`.xfers.bin` と同じ入力。`--scope-raw` 指定時 |
 | `.summary.txt` | 件数、メッセージ別集計、終了状態 |
 | `.metadata.json` | 接続条件、データ形式、時刻の出所、精度、未観測項目 |
+| `.transitions.csv` / `.transitions.txt` | CY4500 と同形式の AVS 解析。`--analyze-transitions` 指定時 |
+| `.transition_summary.csv` / `.transition_summary.txt` | 遷移ごとの読みやすい要約。解析時だけ生成 |
 | `.vbus_events.jsonl` | ソフトウェア VBUS 推定と根拠の測定区間。`--infer-vbus-events` 指定時だけ生成 |
 
 Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 名>.metadata.json` も保存します。オフライン変換は選択した CSV・ccgx3・records JSONL・scope CSV と metadata・summary を生成し、入力の生バイナリは書き換えません。セッションの波形は保存済みの測定プリアンブルから再構成します。
@@ -216,14 +251,14 @@ LICENSE               MIT ライセンス
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 # 任意：別途取得した CY4500 ソースのうち、cy4500_cli.py と
-# ezpd_protocol.py があるフォルダを指定すると、参照互換性テスト 2 件も実行。
+# ezpd_protocol.py があるフォルダを指定すると、参照互換性テスト 3 件も実行。
 $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-合成 PD パケット・ADC の例示バイト列を使い、分割受信、時刻折り返し、符号・単位、再変換、エラー時の生データ保持、ASCII コマンド生成を検証します。参照テストは CY4500 の列構成と読み取り専用 CSV ローダーを使い、参照ソース未指定時はスキップします。
+合成 PD パケット・ADC の例示バイト列を使い、分割受信、時刻折り返し、符号・単位、再変換、エラー時の生データ保持、ASCII コマンド生成、キャプチャの既定動作、AVS 遷移解析を検証します。参照テストは CY4500 の列構成・読み取り専用 CSV ローダー・解析結果と比較し、参照ソース未指定時はスキップします。
 
-2026-10-06 に CY4500 参照チェックを含む 50 件のテストが通りました。ローカルの EZ-PD 4.2.0 Build 155（EPR 改造版 v1.0p）で CSV Import、ccgx3 Open、PD 詳細、波形を確認しました。メーカー版 4.2.0 の CSV パーサーも既存キャプチャの PD 1,881 件をすべて受理し、メーカーの Java クラスでセッションの PD 1,881 件・波形 5,674 点を読み込めました。全波形の値は整数 mV / mA の丸め幅以内で scope CSV と一致しました。追加の合成データでは、推定 UP/DN の CSV Import・ccgx3 Open・行選択と波形位置の一致も確認しました。メーカー版パーサーは全 4 行を受理し、Java クラスは 4 行・6 測定点を読み込めました。検証用の測定データ・メーカーのクラスは Git に含めません。
+2026-10-06 に CY4500 参照チェックを含む 65 件のテストが通りました。ローカルの EZ-PD 4.2.0 Build 155（EPR 改造版 v1.0p）で CSV Import、ccgx3 Open、PD 詳細、波形を確認しました。メーカー版 4.2.0 の CSV パーサーも既存キャプチャの PD 1,881 件をすべて受理し、メーカーの Java クラスでセッションの PD 1,881 件・波形 5,674 点を読み込めました。全波形の値は整数 mV / mA の丸め幅以内で scope CSV と一致しました。追加の合成データでは、推定 UP/DN の CSV Import・ccgx3 Open・行選択と波形位置の一致も確認しました。メーカー版パーサーは全 4 行を受理し、Java クラスは 4 行・6 測定点を読み込めました。検証用の測定データ・メーカーのクラスは Git に含めません。
 
 2026-10-02 の実機確認では USB/HID/CDC の ADC 読み取り、USB PD キャプチャ、単独の HID scope、オフライン再変換を確認しました。検証した個体では HID の PD-only 要求に応答がありませんでした。新 CDC ストリーム・電子負荷・実際のトリガーや電圧変更は未検証です。
 
@@ -234,3 +269,5 @@ $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 [MIT](LICENSE)。メーカー資料はこのリポジトリに含めません。
 
 Java シリアライズ形式は MIT ライセンスの [CY4500 CLI](https://github.com/inuchanbt/cy4500-cli) と同系列の TI CLI に基づきます。メーカーのクラスはローカルでの互換性検証にだけ使い、配布しません。
+
+AVS 遷移解析・レポート形式は MIT ライセンスの CY4500 CLI（copyright 2026 inuchanbt）に基づき、KM003C の時刻・測定頻度と、測定の空きを考慮する判定へ適応しています。

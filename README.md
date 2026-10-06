@@ -27,13 +27,13 @@ Connect the KM003C USB data/control interface to the PC and place the meter in t
 .\.venv\Scripts\python.exe km003c_cli.py capture --seconds 10 --out-prefix captures/pd01
 ```
 
-Capture continuously until Ctrl+C:
+Capture continuously until Ctrl+C (the default):
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py capture --until-ctrl-c --out-prefix captures/pd02
 ```
 
-CSV, `.ccgx3`, native logs, and measurements are enabled by default. `--scope` / `--ccgx3` explicitly select the defaults; add `--scope-raw` to preserve measurement input transfers:
+Omitting `--seconds` captures until Ctrl+C. Omitting `--out-prefix` creates `captures/km003c_<local YYYYMMDD_HHMMSS_microseconds>`. CSV, `.ccgx3`, native logs, and measurements are enabled by default. Scope and ccgx3 are enabled, GoodCRC console lines are hidden, and analysis/inference, raw scope transfers, quiet mode, and overwrite are disabled. Periodic status is printed every second (`--status-interval 1`); `--quiet` suppresses event/status lines. Standalone `scope` retains its five-second default. `--scope` / `--ccgx3` explicitly select the defaults; add `--scope-raw` to preserve measurement input transfers:
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py capture --seconds 10 --scope --scope-raw --out-prefix captures/session01
@@ -81,6 +81,38 @@ python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus
 
 The event time is the first sample after the threshold, with 1 ms device resolution and the polling interval's uncertainty (default 40 ms). It is a software estimate, not a KM003C hardware event; transitions between samples may be missed. Console lines are labeled `[VBUS inferred]`. Selected GUI outputs receive voltage-event rows (`Ok=VBUS_UP/DN`, Utility `VOLT_PKT` adapter), not fabricated PD messages. GUI rows alone cannot distinguish these estimates from hardware VBUS events: share `.vbus_events.jsonl` and metadata with them. The sidecar is always written when inference is enabled, even with `--formats original`, and records `estimated`, source, threshold, sample interval, and GUI row association. `vbus_event_inference` metadata records thresholds, counts, and gap resets; `gui_pd_messages` excludes estimates, while `gui_rows` includes them. Native frames, original JSONL, scope samples, and native PD counts are unchanged.
 
+### AVS transition analysis
+
+```powershell
+# Capture until Ctrl+C with an automatic captures/km003c_<date/time> prefix.
+python km003c_cli.py capture --analyze-transitions
+
+# Fixed-duration capture; VBUS UP/DN inference is independent and optional.
+python km003c_cli.py capture --seconds 10 --analyze-transitions --infer-vbus-events --out-prefix captures/avs01
+
+# Analyze saved native records, without hardware or changing the input.
+python km003c_cli.py convert --input captures/avs01.records.bin --analyze-transitions --out-prefix captures/avs_reanalyzed
+
+# CY4500-style analysis of the PD and scope CSV from the same KM003C capture.
+python km003c_cli.py analyze-sync --pd-csv captures/avs01.csv --scope-csv captures/avs01.scope.csv --out-prefix captures/avs_csv
+```
+
+`--analyze-transitions` is off by default, requires scope, and runs after capture ends (including Ctrl+C) or after offline conversion. It decodes only `EPR_REQUEST` with an RDO and selected EPR AVS PDO, matches subsequent SOP ACCEPT/PS_RDY before the next request, and estimates baseline, movement direction/start, target crossing, target-band settling, observed plateau, and average slew. Fixed/PPS/SPR-AVS requests are outside this analysis. An empty capture or one without AVS requests still produces reports with headers and a no-transitions message. Analysis works with every `--formats` selection, using temporary input files independent of saved GUI/native outputs. Original records and measurements are preserved. `analyze-sync` needs device-timestamped PD/scope files from the same capture; a standalone host-timed `scope` CSV cannot be correlated.
+
+Reports use CY4500's column names/order: `.transitions.csv`, `.transitions.txt`, `.transition_summary.csv`, and `.transition_summary.txt`. Capture/conversion metadata records the analysis settings, status, counts and request-index policy; standalone analyze-sync records settings in the text report. The human summary compares the requested target and measured plateau separately. CSV flags identify KM003C point timestamps, sampled waveforms, missing data, and interrupted/failed captures. The device resolution is 1 ms and default polling is 40 ms: reported latency/slew is an estimate, fast ramps may be missed, and the reports are not a physical USB-PD timing compliance test. No samples or clock offsets are invented. Long gaps/duplicate timestamps break sustained movement and settling; insufficient stable data leaves the plateau or settling fields empty. A nearest measurement more than the allowed sample gap from a request/PS_RDY is marked unavailable.
+
+Common thresholds and option names match CY4500. Defaults tied to native sampling differ:
+
+| Option | KM003C default | CY4500 default |
+| --- | --- | --- |
+| `--movement-sustain-samples` | 2 | 5 |
+| `--settle-hold-ms` / `--observed-settle-hold-ms` | 80 | 20 |
+| `--settle-max-gap-ms` | 100 | 5 |
+| `--plateau-lookback-ms` | 400 | 150 |
+| `--plateau-min-samples` | 6 | 50 |
+
+Other defaults: baseline window/guard 100/5 ms, movement threshold 0.05 V with MAD multiplier 6, target band ±1%, observed band ±0.5%, plateau span limit max(0.10 V, 0.25%), and target guard 10%. All can be overridden using the corresponding CY4500 options shown by `--help`. Changing analysis settings does not change native polling or device configuration.
+
 ## Measurement and offline conversion
 
 ```powershell
@@ -102,8 +134,9 @@ The event time is the first sample after the threshold, with 1 ms device resolut
 | `usb-info` | `--json`, device enumeration |
 | `live-status` / `volt-amp` | `--count`, `--interval`, `--median`, `--csv`, `--instant` |
 | `scope` | `--seconds` / `--until-ctrl-c`, `--csv`, `--raw`, `--quiet`, `--interval`, `--instant`, `--stream`, `--rate` |
-| `capture` | `--seconds` / `--until-ctrl-c`, `--out-prefix`, `--scope` / `--no-scope`, `--scope-raw`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--quiet`, `--hide-goodcrc` / `--show-goodcrc`, `--infer-vbus-events`, `--interval`, `--allow-framing-errors`, `--gui-csv` |
-| `export-gui` / `convert` / `decode` | `--records` / `--input`, `--out-prefix`, `--scope` / `--no-scope`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--infer-vbus-events`, `--allow-framing-errors` |
+| `capture` | `--seconds` / `--until-ctrl-c`, `--out-prefix`, `--scope` / `--no-scope`, `--scope-raw`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--quiet`, `--hide-goodcrc` / `--show-goodcrc`, `--infer-vbus-events`, `--analyze-transitions`, `--status-interval`, `--interval`, `--allow-framing-errors`, `--gui-csv` |
+| `export-gui` / `convert` / `decode` | `--records` / `--input`, `--out-prefix`, `--scope` / `--no-scope`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--infer-vbus-events`, `--analyze-transitions`, `--allow-framing-errors` |
+| `analyze-sync` | `--pd-csv`, `--scope-csv`, `--out-prefix`, `--force`, transition analysis options |
 | `adc` | `--count`, `--interval`, `--csv`, `--jsonl`, `--instant` |
 
 Use `<command> --help` for all options. Utility CSV is generated by default by `capture`; `--gui-csv` is accepted for compatibility. `--scope-raw` requires `--scope`. ADC uses device-averaged VBUS/IBUS by default; `--instant` selects instantaneous values.
@@ -133,6 +166,8 @@ Options follow the command: `--transport auto|hid|usb|cdc`, `--serial`, `--vid`,
 | `.scope.xfers.bin` | Same input transfers as `.xfers.bin`, including measurement preambles; with `--scope-raw` |
 | `.summary.txt` | Counts, message statistics, completion status |
 | `.metadata.json` | Connection settings, formats, time sources, resolution, unobserved fields |
+| `.transitions.csv` / `.transitions.txt` | AVS analysis in the CY4500 report layout; only with `--analyze-transitions` |
+| `.transition_summary.csv` / `.transition_summary.txt` | Per-transition human summary; only with analysis |
 | `.vbus_events.jsonl` | Software VBUS estimates and supporting sample intervals; only with `--infer-vbus-events` |
 
 Live-status CSV has CY4500's 18 columns. Standalone `scope` also writes `<CSV filename>.metadata.json`. Offline export produces the selected CSV/ccgx3/records JSONL/scope CSV plus metadata and summary; it does not rewrite native binary input. Waveforms for offline sessions are reconstructed from saved measurement preambles.
@@ -216,14 +251,14 @@ Manufacturer documents/demo binaries and measurement files are **not distributed
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 # Optional: directory containing your separate CY4500 checkout's
-# cy4500_cli.py and ezpd_protocol.py; enables two reference compatibility tests.
+# cy4500_cli.py and ezpd_protocol.py; enables three reference compatibility tests.
 $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests cover synthetic PD packets, ADC example bytes, fragmented reads, timestamp wraparound, signs/units, offline export, raw evidence on decode errors, and ASCII command generation. Reference tests compare column layouts and run CY4500's read-only CSV loaders; they skip if no reference checkout is supplied.
+Tests cover synthetic PD packets, ADC example bytes, fragmented reads, timestamp wraparound, signs/units, offline export, raw evidence on decode errors, ASCII command generation, capture defaults, and AVS transition analysis. Reference tests compare column layouts, read-only CSV loading, and analysis results with CY4500; they skip if no reference checkout is supplied.
 
-On 2026-10-06, all 50 tests passed with CY4500 reference checks enabled. Local EZ-PD 4.2.0 Build 155 (EPR mod v1.0p) GUI checks confirmed CSV Import, ccgx3 Open, PD details, and waveforms. The stock 4.2.0 CSV parser accepted all 1,881 PD messages in an existing capture; its Java classes deserialized the session's 1,881 packets and 5,674 waveform samples. All graph values matched scope CSV within integer mV/mA rounding. Additional synthetic-data checks confirmed inferred UP/DN rows in CSV Import and ccgx3 Open, row selection and waveform alignment; the stock parser accepted all four rows and its Java classes deserialized four rows and six samples. Those local measurements and manufacturer classes are excluded from Git.
+On 2026-10-06, all 65 tests passed with CY4500 reference checks enabled. Local EZ-PD 4.2.0 Build 155 (EPR mod v1.0p) GUI checks confirmed CSV Import, ccgx3 Open, PD details, and waveforms. The stock 4.2.0 CSV parser accepted all 1,881 PD messages in an existing capture; its Java classes deserialized the session's 1,881 packets and 5,674 waveform samples. All graph values matched scope CSV within integer mV/mA rounding. Additional synthetic-data checks confirmed inferred UP/DN rows in CSV Import and ccgx3 Open, row selection and waveform alignment; the stock parser accepted all four rows and its Java classes deserialized four rows and six samples. Those local measurements and manufacturer classes are excluded from Git.
 
 Hardware checks on 2026-10-02 confirmed ADC reading over USB/HID/CDC, USB PD capture, standalone HID scope, and offline replay. HID PD-only requests did not respond on the tested unit. New CDC streaming, electronic loads, and live trigger/voltage changes remain unverified.
 
@@ -234,3 +269,5 @@ Implementation references include manufacturer interface/CDC/PDM documentation a
 [MIT](LICENSE). Manufacturer material is excluded from this repository.
 
 The Java serialization schema is shared with the MIT-licensed [CY4500 CLI](https://github.com/inuchanbt/cy4500-cli) and sibling TI CLI. Manufacturer classes are used only for local compatibility verification and are not distributed.
+
+AVS transition analysis and report layouts are adapted from the MIT-licensed CY4500 CLI (copyright 2026 inuchanbt), with KM003C clock/sampling adaptations and conservative gap handling.

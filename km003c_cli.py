@@ -24,8 +24,10 @@ from km003c_modules.protocol import (
 from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices
 from km003c_modules.utility_export import UtilityExport, packet_for_event, packet_for_vbus_event
 from km003c_modules.vbus_events import VbusEventDetector
+from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUFFIXES,
+    add_analysis_options, run_analysis, load_analysis_csv, print_analysis_outputs)
 
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 
 
 def positive_float(text):
@@ -91,8 +93,10 @@ def connection_options(parser, *, cdc_only=False):
 
 def duration_options(parser, seconds):
     duration = parser.add_mutually_exclusive_group()
-    duration.add_argument('--seconds', type=positive_float, default=seconds)
-    duration.add_argument('--until-ctrl-c', action='store_true')
+    duration.add_argument('--seconds', type=positive_float, default=seconds,
+                         help='stop after this many seconds' + (' (default: until Ctrl+C)' if seconds is None else ''))
+    duration.add_argument('--until-ctrl-c', action='store_true',
+                         help='capture continuously until Ctrl+C' + (' (default)' if seconds is None else ''))
 
 
 def ascii_options(parser):
@@ -119,6 +123,9 @@ def gui_output_options(parser):
                         help='infer software VBUS_UP/DN from measurements (default: off); '
                              '4.0V/0.8V thresholds, no initial event or inference across gaps >100ms; '
                              'requires scope; saves GUI rows and .vbus_events.jsonl')
+    parser.add_argument('--analyze-transitions', action='store_true',
+                        help='analyze EPR AVS voltage transitions after capture/conversion (default: off; requires scope)')
+    add_analysis_options(parser, positive_float, nonnegative_float, positive_int)
 
 
 def build_arg_parser():
@@ -163,8 +170,9 @@ def build_arg_parser():
 
     p = sub.add_parser('capture', help='record PD events, native frames and optional scope CSV')
     connection_options(p)
-    duration_options(p, 8.0)
-    p.add_argument('--out-prefix', default='km003c_capture')
+    duration_options(p, None)
+    p.add_argument('--out-prefix', default=None,
+                   help='output prefix (default: captures/km003c_<local date and time>)')
     gui_output_options(p)
     p.add_argument('--scope-raw', action='store_true')
     p.add_argument('--quiet', action='store_true')
@@ -177,6 +185,8 @@ def build_arg_parser():
                          help='show GOODCRC console lines')
     p.set_defaults(hide_goodcrc=True)
     p.add_argument('--interval', type=nonnegative_float, default=0.04, help='PD polling interval in seconds')
+    p.add_argument('--status-interval', type=positive_float, default=1.0,
+                   help='periodic console status interval in seconds (default: 1)')
     p.set_defaults(func=run_capture)
 
     p = sub.add_parser('export-gui', aliases=['decode', 'convert'], help='convert saved native records to Utility CSV/ccgx3 offline')
@@ -185,6 +195,14 @@ def build_arg_parser():
     gui_output_options(p)
     p.add_argument('--allow-framing-errors', action='store_true')
     p.set_defaults(func=run_export)
+
+    p = sub.add_parser('analyze-sync', help='offline EPR AVS analysis of KM003C PD and scope CSV')
+    p.add_argument('--pd-csv', required=True)
+    p.add_argument('--scope-csv', required=True)
+    p.add_argument('--out-prefix', default='km003c_sync_analysis')
+    p.add_argument('--force', action='store_true')
+    add_analysis_options(p, positive_float, nonnegative_float, positive_int)
+    p.set_defaults(func=run_analyze_sync)
 
     p = sub.add_parser('pdm', help='open/close/configure the fast-charge trigger module')
     p.add_argument('action', choices=['open', 'close', 'set'])
@@ -521,6 +539,8 @@ def output_formats(args):
 def capture_output_paths(args, *, live):
     formats = output_formats(args)
     suffixes = ['.metadata.json', '.summary.txt']
+    if args.analyze_transitions:
+        suffixes.extend(TRANSITION_OUTPUT_SUFFIXES)
     if args.infer_vbus_events:
         suffixes.append('.vbus_events.jsonl')
     if 'csv' in formats:
@@ -559,6 +579,8 @@ def print_capture_outputs(export):
     if export.vbus_file:
         print(f'Inferred VBUS events: {export.prefix.with_suffix(".vbus_events.jsonl").resolve()} '
               f'({sum(export.detector.counts.values())} estimates)')
+    if export.transition_session:
+        print_analysis_outputs(export.analyses, export.prefix)
 
 
 class CaptureExport:
@@ -574,6 +596,9 @@ class CaptureExport:
             self.pd_writer.writerow(PD_COLUMNS)
         self.jsonl = open_output(stack, self.prefix.with_suffix('.records.jsonl'), bom=False) if original else None
         self.detector = VbusEventDetector() if args.infer_vbus_events else None
+        self.transition_session = TransitionSession(stack) if args.analyze_transitions else None
+        self.analyses = []
+        self.analysis_info = {'enabled': bool(args.analyze_transitions)}
         self.vbus_file = (open_output(stack, self.prefix.with_suffix('.vbus_events.jsonl'), bom=False)
                           if self.detector else None)
         self.scope_file = open_output(stack, self.prefix.with_suffix('.scope.csv')) if args.scope and original else None
@@ -657,6 +682,8 @@ class CaptureExport:
                         self.scope_writer.writerow(sample.scope_row(self.frames, packet_index, 0))
                     self.utility.write_scope(sample)
                     self.infer_vbus(sample)
+                    if self.transition_session:
+                        self.transition_session.measurement(sample)
                 for event in events:
                     self.events += 1
                     if event.kind == 'unknown':
@@ -669,6 +696,8 @@ class CaptureExport:
                     elif adapted is None:
                         self.gui_omitted[event.message] += 1
                     record['events'].append({**asdict(event), 'gui_exported': exported})
+                    if self.transition_session:
+                        self.transition_session.event(event, self.gui_rows if exported else self.events)
                     if not getattr(self.args, 'quiet', True) and not (
                             getattr(self.args, 'hide_goodcrc', True) and event.message == 'GOODCRC'):
                         print(f'{self.events:6d} {event.timestamp_us:12d} us  {event.message}')
@@ -693,6 +722,15 @@ class CaptureExport:
         except (OSError, ValueError) as exc:
             archive_error = exc
             status, error = 'failed', str(exc)
+        if self.transition_session:
+            try:
+                self.analyses, settings = self.transition_session.finish(self.args, status)
+                self.analysis_info.update(status='completed', transitions=len(self.analyses), settings=settings,
+                                          request_index_policy='GUI Sno when exported; otherwise native event index')
+            except (OSError, ValueError) as exc:
+                self.analysis_info.update(status='failed', error=str(exc))
+                archive_error = archive_error or exc
+                status, error = 'failed', str(exc)
         info = metadata(self.args, status=status, error=error, frames=self.frames,
                         events=self.events, scope_samples=self.samples,
                         framing_errors=self.errors, message_counts=dict(self.messages),
@@ -700,6 +738,7 @@ class CaptureExport:
                         output_formats=sorted(self.formats), gui_pd_messages=self.gui_events,
                         gui_rows=self.gui_rows, gui_inferred_vbus_events=self.gui_inferred_events,
                         vbus_event_inference=self.detector.summary() if self.detector else {'enabled': False},
+                        transition_analysis=self.analysis_info,
                         goodcrc_console_policy='hide decoded GOODCRC; CRC validity not exposed' if
                         getattr(self.args, 'hide_goodcrc', True) else 'show GOODCRC',
                         gui_omitted_events=dict(self.gui_omitted),
@@ -724,6 +763,7 @@ class CaptureExport:
                    f'GUI PD messages: {self.gui_events}', f'GUI omitted events: {dict(self.gui_omitted)}',
                    f'GUI inferred VBUS events: {self.gui_inferred_events}',
                    f'VBUS inference: {self.detector.summary() if self.detector else {"enabled": False}}',
+                   f'AVS transition analysis: {self.analysis_info}',
                    f'CCGX3 waveform samples: {self.utility.scope_count}',
                    'CRC/EOP, wire duration and delta: not exposed',
                    'Start Time == End Time: one observed event timestamp, not physical wire start/end',
@@ -738,6 +778,9 @@ class CaptureExport:
 
 
 def run_capture(args):
+    args.until_ctrl_c = args.seconds is None
+    if args.out_prefix is None:
+        args.out_prefix = str(Path('captures') / ('km003c_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f')))
     status, error = 'completed', None
     check_capture_outputs(args, live=True)
     with ExitStack() as stack:
@@ -747,10 +790,16 @@ def run_capture(args):
         meter.on_transfer = export.transfer
         origin = time.monotonic()
         deadline = math.inf if args.until_ctrl_c else origin + args.seconds
+        next_status = origin + args.status_interval
         try:
             while time.monotonic() < deadline:
                 started = time.monotonic()
                 export.frame(meter.get_data(PD_PACKET))
+                now = time.monotonic()
+                if not args.quiet and now >= next_status:
+                    print(f'[status] {now - origin:.1f}s  frames={export.frames} '
+                          f'PD/status={export.events}  scope={export.samples}  framing_errors={export.errors}')
+                    next_status = now + args.status_interval
                 wait_interval(started, args.interval)
         except KeyboardInterrupt:
             status = 'interrupted'
@@ -783,6 +832,21 @@ def run_export(args):
     return 0
 
 
+def run_analyze_sync(args):
+    inputs = {Path(path).expanduser().resolve() for path in (args.pd_csv, args.scope_csv)}
+    prefix = Path(args.out_prefix).expanduser()
+    for suffix in TRANSITION_OUTPUT_SUFFIXES:
+        path = prefix.with_suffix(suffix)
+        if path.resolve() in inputs:
+            raise ValueError('Analysis output would overwrite an input CSV')
+        if path.exists() and (not args.force or path.is_dir()):
+            raise FileExistsError(f'{path} exists; choose another prefix or use --force')
+    pd, scope = load_analysis_csv(args.pd_csv, args.scope_csv)
+    analyses, _ = run_analysis(pd, scope, args)
+    print_analysis_outputs(analyses, prefix)
+    return 0
+
+
 def validate_args(args, parser):
     if hasattr(args, 'vid') and not (0 <= args.vid <= 65535 and 0 <= args.pid <= 65535):
         parser.error('VID/PID must fit 16 bits')
@@ -797,6 +861,10 @@ def validate_args(args, parser):
         parser.error('--scope-raw requires --scope')
     if getattr(args, 'infer_vbus_events', False) and not args.scope:
         parser.error('--infer-vbus-events requires --scope')
+    if getattr(args, 'analyze_transitions', False) and not args.scope:
+        parser.error('--analyze-transitions requires --scope')
+    if hasattr(args, 'baseline_guard_ms') and args.baseline_guard_ms >= args.baseline_window_ms:
+        parser.error('--baseline-guard-ms must be smaller than --baseline-window-ms')
     if args.func is run_ascii:
         try:
             build_ascii_command(args)
