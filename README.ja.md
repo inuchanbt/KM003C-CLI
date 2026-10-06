@@ -65,7 +65,21 @@ python km003c_cli.py convert --input captures/session01.records.bin --out-prefix
 
 GUI CSV・ccgx3 は実際に観測した PD メッセージを `SOP`、`SOP_PRIME`、`SOP_DPRIME` と `v1` / `v2` / `v3` の表記で保存します。PD ヘッダーのない状態・未知イベントと未検証の SOP 種別は GUI ファイルから除外し、metadata に件数を記録します。**既定の original 形式の JSONL・生データには元のバイト列を含めて残します。** GoodCRC は保存します。GUI 形式だけを選ぶと元データのログは生成しません。
 
-KM003C に CRC / EOP 判定や物理的な通信時間がないため、`Ok`、`Duration`、`Delta` は空欄、開始・終了は同じ観測時刻です。セッションの `pktData` は GUI デコーダー用に組み立てたデータで、OK / CRC / EOP ビットを立てず、CY4500 の実キャプチャとしては扱いません。波形の `GraphData` は物理値を整数 mV / mA に丸めて保存し、電流の符号も保持します。元の精度の値は scope CSV・JSONL に残します。VBUS は unsigned 16-bit の mV（上限 65.535 V）、CC・電流は signed 16-bit です。範囲外の値は範囲内に収め、`ccgx3_graph_clipped` に件数を記録します。メーカー版 4.2.0 の GUI は 32.767 V を超える VBUS を負数として表示しますが、EPR 改造版 Build 155 は正しく表示します。GUI の軸範囲によって負電流が見えない場合があります。測定点の補間・追加はせず、KM003C の 1 ms 分解能・ポーリング頻度を保持します。
+実際に観測した PD メッセージでは、KM003C に CRC / EOP 判定や物理的な通信時間がないため、`Ok`、`Duration`、`Delta` は空欄、開始・終了は同じ観測時刻です。セッションの `pktData` は GUI デコーダー用に組み立てたデータで、OK / CRC / EOP ビットを立てず、CY4500 の実キャプチャとしては扱いません。波形の `GraphData` は物理値を整数 mV / mA に丸めて保存し、電流の符号も保持します。元の精度の値は scope CSV・JSONL に残します。VBUS は unsigned 16-bit の mV（上限 65.535 V）、CC・電流は signed 16-bit です。範囲外の値は範囲内に収め、`ccgx3_graph_clipped` に件数を記録します。メーカー版 4.2.0 の GUI は 32.767 V を超える VBUS を負数として表示しますが、EPR 改造版 Build 155 は正しく表示します。GUI の軸範囲によって負電流が見えない場合があります。測定点の補間・追加はせず、KM003C の 1 ms 分解能・ポーリング頻度を保持します。
+
+### GoodCRC 表示と VBUS イベント推定
+
+`capture --hide-goodcrc` は `GOODCRC` のコンソール表示だけを省きます。CY4500/TI と同じく既定で有効です。`--show-goodcrc` で表示し、`--quiet` で全イベントの表示を省きます。選択した保存形式には GoodCRC を残し、未知イベントや framing error はこのフィルターで隠しません。KM003C は CRC / EOP / idle error 判定を提供しないため、CY4500 の「正常な GoodCRC だけを隠す」という区別までは再現できません。
+
+```powershell
+python km003c_cli.py capture --until-ctrl-c --hide-goodcrc --infer-vbus-events --out-prefix captures/vbus01
+python km003c_cli.py capture --seconds 10 --show-goodcrc --out-prefix captures/goodcrc01
+python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus-events --out-prefix captures/vbus_converted
+```
+
+`--infer-vbus-events` は**既定で無効**です。capture とオフライン変換で使え、測定（既定で有効な `--scope`）を必要とします。デバイス時刻付きの PD ステータスプリアンブルだけから、TI と同じしきい値で推定します。低状態を確認した後の 4,000 mV 以上で `VBUS_UP`、高状態を確認した後の 800 mV 以下で `VBUS_DN` を生成します。中間の電圧では状態を保持します。初回の測定では生成せず、100,000 µs を超える測定間隔・同一時刻・時刻逆行では基準をリセットして、その測定点からイベントを生成しません。
+
+時刻はしきい値を超えた最初の測定点で、1 ms のデバイス分解能とポーリング間隔（既定 40 ms）による不確かさがあります。KM003C のハードウェアイベントではなくソフトウェア推定で、測定点の間の変化は見逃す場合があります。コンソールには `[VBUS inferred]` と表示します。選択した GUI 出力には電圧イベント行（`Ok=VBUS_UP/DN`、Utility の `VOLT_PKT` 形式）を追加し、PD メッセージは捏造しません。GUI の行だけでは実機 VBUS イベントと区別できないため、共有時は `.vbus_events.jsonl` と metadata も添付してください。この JSONL は `--formats original` でも必ず生成し、`estimated`・出所・しきい値・測定区間・GUI 行との対応を記録します。metadata の `vbus_event_inference` はしきい値・件数・間隔リセット数を記録し、`gui_pd_messages` は推定を除外、`gui_rows` は推定行を含めます。生フレーム・元の JSONL・測定点・実機 PD 件数は変更しません。
 
 ## 測定とオフライン変換
 
@@ -88,8 +102,8 @@ KM003C に CRC / EOP 判定や物理的な通信時間がないため、`Ok`、`
 | `usb-info` | `--json`、デバイス列挙 |
 | `live-status` / `volt-amp` | `--count`、`--interval`、`--median`、`--csv`、`--instant` |
 | `scope` | `--seconds` / `--until-ctrl-c`、`--csv`、`--raw`、`--quiet`、`--interval`、`--instant`、`--stream`、`--rate` |
-| `capture` | `--seconds` / `--until-ctrl-c`、`--out-prefix`、`--scope` / `--no-scope`、`--scope-raw`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--quiet`、`--interval`、`--allow-framing-errors`、`--gui-csv` |
-| `export-gui` / `convert` / `decode` | `--records` / `--input`、`--out-prefix`、`--scope` / `--no-scope`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--allow-framing-errors` |
+| `capture` | `--seconds` / `--until-ctrl-c`、`--out-prefix`、`--scope` / `--no-scope`、`--scope-raw`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--quiet`、`--hide-goodcrc` / `--show-goodcrc`、`--infer-vbus-events`、`--interval`、`--allow-framing-errors`、`--gui-csv` |
+| `export-gui` / `convert` / `decode` | `--records` / `--input`、`--out-prefix`、`--scope` / `--no-scope`、`--ccgx3` / `--no-ccgx3`、`--formats`、`--force`、`--infer-vbus-events`、`--allow-framing-errors` |
 | `adc` | `--count`、`--interval`、`--csv`、`--jsonl`、`--instant` |
 
 全オプションは `<コマンド> --help` で確認できます。`capture` は既定で Utility CSV を生成し、`--gui-csv` は互換用の指定です。`--scope-raw` には `--scope` が必要です。ADC は既定でメーターの平均済み VBUS/IBUS を使い、`--instant` で瞬時値へ切り替えます。
@@ -119,6 +133,7 @@ KM003C に CRC / EOP 判定や物理的な通信時間がないため、`Ok`、`
 | `.scope.xfers.bin` | 測定プリアンブルを含む転送データ。`.xfers.bin` と同じ入力。`--scope-raw` 指定時 |
 | `.summary.txt` | 件数、メッセージ別集計、終了状態 |
 | `.metadata.json` | 接続条件、データ形式、時刻の出所、精度、未観測項目 |
+| `.vbus_events.jsonl` | ソフトウェア VBUS 推定と根拠の測定区間。`--infer-vbus-events` 指定時だけ生成 |
 
 Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 名>.metadata.json` も保存します。オフライン変換は選択した CSV・ccgx3・records JSONL・scope CSV と metadata・summary を生成し、入力の生バイナリは書き換えません。セッションの波形は保存済みの測定プリアンブルから再構成します。
 
@@ -208,7 +223,7 @@ $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 
 合成 PD パケット・ADC の例示バイト列を使い、分割受信、時刻折り返し、符号・単位、再変換、エラー時の生データ保持、ASCII コマンド生成を検証します。参照テストは CY4500 の列構成と読み取り専用 CSV ローダーを使い、参照ソース未指定時はスキップします。
 
-2026-10-06 に CY4500 参照チェックを含む 42 件のテストが通りました。ローカルの EZ-PD 4.2.0 Build 155（EPR 改造版 v1.0p）で CSV Import、ccgx3 Open、PD 詳細、波形を確認しました。メーカー版 4.2.0 の CSV パーサーも既存キャプチャの PD 1,881 件をすべて受理し、メーカーの Java クラスでセッションの PD 1,881 件・波形 5,674 点を読み込めました。全波形の値は整数 mV / mA の丸め幅以内で scope CSV と一致しました。検証用の測定データ・メーカーのクラスは Git に含めません。
+2026-10-06 に CY4500 参照チェックを含む 50 件のテストが通りました。ローカルの EZ-PD 4.2.0 Build 155（EPR 改造版 v1.0p）で CSV Import、ccgx3 Open、PD 詳細、波形を確認しました。メーカー版 4.2.0 の CSV パーサーも既存キャプチャの PD 1,881 件をすべて受理し、メーカーの Java クラスでセッションの PD 1,881 件・波形 5,674 点を読み込めました。全波形の値は整数 mV / mA の丸め幅以内で scope CSV と一致しました。追加の合成データでは、推定 UP/DN の CSV Import・ccgx3 Open・行選択と波形位置の一致も確認しました。メーカー版パーサーは全 4 行を受理し、Java クラスは 4 行・6 測定点を読み込めました。検証用の測定データ・メーカーのクラスは Git に含めません。
 
 2026-10-02 の実機確認では USB/HID/CDC の ADC 読み取り、USB PD キャプチャ、単独の HID scope、オフライン再変換を確認しました。検証した個体では HID の PD-only 要求に応答がありませんでした。新 CDC ストリーム・電子負荷・実際のトリガーや電圧変更は未検証です。
 

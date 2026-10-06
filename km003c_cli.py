@@ -22,9 +22,10 @@ from km003c_modules.protocol import (
     logical_packets, measurement_dict,
 )
 from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices
-from km003c_modules.utility_export import UtilityExport, packet_for_event
+from km003c_modules.utility_export import UtilityExport, packet_for_event, packet_for_vbus_event
+from km003c_modules.vbus_events import VbusEventDetector
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 
 
 def positive_float(text):
@@ -114,6 +115,10 @@ def gui_output_options(parser):
                         help='TI-style output selection; default: all; --[no-]ccgx3 overrides this selection')
     parser.add_argument('--force', action='store_true', help='overwrite existing outputs (default: refuse collisions)')
     parser.add_argument('--gui-csv', action='store_true', help='compatibility alias; Utility CSV is the default')
+    parser.add_argument('--infer-vbus-events', action='store_true',
+                        help='infer software VBUS_UP/DN from measurements (default: off); '
+                             '4.0V/0.8V thresholds, no initial event or inference across gaps >100ms; '
+                             'requires scope; saves GUI rows and .vbus_events.jsonl')
 
 
 def build_arg_parser():
@@ -164,6 +169,13 @@ def build_arg_parser():
     p.add_argument('--scope-raw', action='store_true')
     p.add_argument('--quiet', action='store_true')
     p.add_argument('--allow-framing-errors', action='store_true')
+    goodcrc = p.add_mutually_exclusive_group()
+    goodcrc.add_argument('--hide-goodcrc', dest='hide_goodcrc', action='store_true',
+                         help='hide decoded GOODCRC console lines (default); all saved data is preserved; '
+                              'KM003C does not expose CRC validity')
+    goodcrc.add_argument('--show-goodcrc', dest='hide_goodcrc', action='store_false',
+                         help='show GOODCRC console lines')
+    p.set_defaults(hide_goodcrc=True)
     p.add_argument('--interval', type=nonnegative_float, default=0.04, help='PD polling interval in seconds')
     p.set_defaults(func=run_capture)
 
@@ -509,6 +521,8 @@ def output_formats(args):
 def capture_output_paths(args, *, live):
     formats = output_formats(args)
     suffixes = ['.metadata.json', '.summary.txt']
+    if args.infer_vbus_events:
+        suffixes.append('.vbus_events.jsonl')
     if 'csv' in formats:
         suffixes.append('.csv')
     if 'ccgx3' in formats:
@@ -534,13 +548,17 @@ def check_capture_outputs(args, *, live, source=None):
 
 
 def print_capture_outputs(export):
+    inferred = f', {export.gui_inferred_events} inferred VBUS events' if export.detector else ''
     if 'csv' in export.formats:
-        print(f'PD CSV: {export.prefix.with_suffix(".csv").resolve()} ({export.gui_events} PD messages)')
+        print(f'PD CSV: {export.prefix.with_suffix(".csv").resolve()} ({export.gui_events} PD messages{inferred})')
     if 'ccgx3' in export.formats:
         print(f'CCGX3: {export.prefix.with_suffix(".ccgx3").resolve()} '
-              f'({export.gui_events} PD messages, {export.utility.scope_count} waveform samples)')
+              f'({export.gui_events} PD messages{inferred}, {export.utility.scope_count} waveform samples)')
     if export.scope_file:
         print(f'Scope CSV: {export.prefix.with_suffix(".scope.csv").resolve()} ({export.samples} samples)')
+    if export.vbus_file:
+        print(f'Inferred VBUS events: {export.prefix.with_suffix(".vbus_events.jsonl").resolve()} '
+              f'({sum(export.detector.counts.values())} estimates)')
 
 
 class CaptureExport:
@@ -555,6 +573,9 @@ class CaptureExport:
         if self.pd_writer:
             self.pd_writer.writerow(PD_COLUMNS)
         self.jsonl = open_output(stack, self.prefix.with_suffix('.records.jsonl'), bom=False) if original else None
+        self.detector = VbusEventDetector() if args.infer_vbus_events else None
+        self.vbus_file = (open_output(stack, self.prefix.with_suffix('.vbus_events.jsonl'), bom=False)
+                          if self.detector else None)
         self.scope_file = open_output(stack, self.prefix.with_suffix('.scope.csv')) if args.scope and original else None
         self.scope_writer = csv.writer(self.scope_file) if self.scope_file else None
         if self.scope_writer:
@@ -569,9 +590,35 @@ class CaptureExport:
         stack.callback(self.utility.close)
         self.clock = ClockUnwrapper()
         self.frames = self.events = self.samples = self.errors = self.unknown_events = 0
-        self.gui_events = 0
+        self.gui_events = self.gui_rows = self.gui_inferred_events = 0
         self.gui_omitted = Counter()
         self.messages = Counter()
+
+    def write_gui_packet(self, adapted):
+        if not self.formats & {'csv', 'ccgx3'}:
+            return False
+        raw_packet, row = adapted
+        self.gui_rows += 1
+        if self.pd_writer:
+            self.pd_writer.writerow(row)
+        self.utility.write_packet(raw_packet, row)
+        return True
+
+    def infer_vbus(self, sample):
+        if self.detector is None:
+            return
+        event = self.detector.observe(sample)
+        if event is None:
+            return
+        exported = self.write_gui_packet(packet_for_vbus_event(event, self.gui_rows + 1))
+        if exported:
+            self.gui_inferred_events += 1
+        json_line(self.vbus_file, {**event, 'frame_index': self.frames,
+                                  'gui_exported': exported,
+                                  'gui_row_index': self.gui_rows if exported else None})
+        if not getattr(self.args, 'quiet', True):
+            print(f'[VBUS inferred] {event["timestamp_us"]:12d} us  '
+                  f'{event["event"]} {event["vbus_mV"]} mV')
 
     def transfer(self, raw):
         if self.transfers:
@@ -609,23 +656,21 @@ class CaptureExport:
                     if self.scope_writer:
                         self.scope_writer.writerow(sample.scope_row(self.frames, packet_index, 0))
                     self.utility.write_scope(sample)
+                    self.infer_vbus(sample)
                 for event in events:
                     self.events += 1
                     if event.kind == 'unknown':
                         self.unknown_events += 1
                     self.messages[event.message] += 1
-                    adapted = packet_for_event(event, self.gui_events + 1)
-                    exported = adapted is not None and bool(self.formats & {'csv', 'ccgx3'})
+                    adapted = packet_for_event(event, self.gui_rows + 1)
+                    exported = adapted is not None and self.write_gui_packet(adapted)
                     if exported:
-                        raw_packet, row = adapted
                         self.gui_events += 1
-                        if self.pd_writer:
-                            self.pd_writer.writerow(row)
-                        self.utility.write_packet(raw_packet, row)
                     elif adapted is None:
                         self.gui_omitted[event.message] += 1
                     record['events'].append({**asdict(event), 'gui_exported': exported})
-                    if not getattr(self.args, 'quiet', True):
+                    if not getattr(self.args, 'quiet', True) and not (
+                            getattr(self.args, 'hide_goodcrc', True) and event.message == 'GOODCRC'):
                         print(f'{self.events:6d} {event.timestamp_us:12d} us  {event.message}')
         except ProtocolError as exc:
             self.errors += 1
@@ -653,10 +698,14 @@ class CaptureExport:
                         framing_errors=self.errors, message_counts=dict(self.messages),
                         unknown_pd_events=self.unknown_events,
                         output_formats=sorted(self.formats), gui_pd_messages=self.gui_events,
+                        gui_rows=self.gui_rows, gui_inferred_vbus_events=self.gui_inferred_events,
+                        vbus_event_inference=self.detector.summary() if self.detector else {'enabled': False},
+                        goodcrc_console_policy='hide decoded GOODCRC; CRC validity not exposed' if
+                        getattr(self.args, 'hide_goodcrc', True) else 'show GOODCRC',
                         gui_omitted_events=dict(self.gui_omitted),
                         ccgx3_waveform_samples=self.utility.scope_count,
                         ccgx3_graph_clipped=self.utility.graph_clipped,
-                        ccgx3_packet_data='synthetic GUI adapter; not native CY4500 records; no OK/CRC/EOP bits asserted',
+                        ccgx3_packet_data='synthetic GUI adapter; not native CY4500 records; no OK/CRC/EOP bits asserted; inferred VBUS uses VOLT_PKT',
                         ccgx3_graph_scaling='GraphData physical mV/mA rounded to integers; signed IBUS; EPR GUI unsigned VBUS',
                         gui_omitted_policy='status/unknown events have no PD header; retained in original-format JSONL/native records',
                         unknown_pd_policy='preserve the remaining logical payload; resume at the next logical packet/response',
@@ -673,6 +722,8 @@ class CaptureExport:
                    f'Framing errors: {self.errors}', 'Clock: device milliseconds converted to microseconds',
                    f'Unknown PD event payloads: {self.unknown_events}',
                    f'GUI PD messages: {self.gui_events}', f'GUI omitted events: {dict(self.gui_omitted)}',
+                   f'GUI inferred VBUS events: {self.gui_inferred_events}',
+                   f'VBUS inference: {self.detector.summary() if self.detector else {"enabled": False}}',
                    f'CCGX3 waveform samples: {self.utility.scope_count}',
                    'CRC/EOP, wire duration and delta: not exposed',
                    'Start Time == End Time: one observed event timestamp, not physical wire start/end',
@@ -744,6 +795,8 @@ def validate_args(args, parser):
             parser.error('--stream uses the CDC port')
     if args.command == 'capture' and args.scope_raw and not args.scope:
         parser.error('--scope-raw requires --scope')
+    if getattr(args, 'infer_vbus_events', False) and not args.scope:
+        parser.error('--infer-vbus-events requires --scope')
     if args.func is run_ascii:
         try:
             build_ascii_command(args)

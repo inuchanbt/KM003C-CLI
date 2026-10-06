@@ -65,7 +65,21 @@ python km003c_cli.py convert --input captures/session01.records.bin --out-prefix
 
 GUI CSV/ccgx3 contain observed PD messages with `SOP`, `SOP_PRIME`, `SOP_DPRIME` and `v1`/`v2`/`v3` values. Headerless status/unknown events and unverified SOP kinds are omitted from GUI files and counted in metadata; **default original-format JSONL/native logs retain them**, including raw bytes. GoodCRC messages are retained. Selecting only GUI formats intentionally omits those original logs.
 
-KM003C supplies no CRC/EOP result or wire duration: `Ok`, `Duration`, and `Delta` remain blank, and start/end are the same observed point timestamp. The session's `pktData` is a synthetic GUI decoder adapter, with no OK/CRC/EOP bits asserted; it is not a CY4500 capture. Waveform `GraphData` stores physical mV/mA rounded to integers, including signed current; scope CSV/JSONL retain the full original precision. VBUS is stored as an unsigned 16-bit mV value (up to 65.535 V); CC/current use signed 16-bit fields. Out-of-range values are bounded and counted in `ccgx3_graph_clipped`. The stock 4.2.0 GUI interprets VBUS above 32.767 V as negative; the EPR-modified Build 155 GUI reads it correctly. GUI axis limits may hide negative current. No samples are interpolated or added, and KM003C's 1 ms timestamp resolution / polling rate are unchanged.
+For observed PD messages, KM003C supplies no CRC/EOP result or wire duration: `Ok`, `Duration`, and `Delta` remain blank, and start/end are the same observed point timestamp. The session's `pktData` is a synthetic GUI decoder adapter, with no OK/CRC/EOP bits asserted; it is not a CY4500 capture. Waveform `GraphData` stores physical mV/mA rounded to integers, including signed current; scope CSV/JSONL retain the full original precision. VBUS is stored as an unsigned 16-bit mV value (up to 65.535 V); CC/current use signed 16-bit fields. Out-of-range values are bounded and counted in `ccgx3_graph_clipped`. The stock 4.2.0 GUI interprets VBUS above 32.767 V as negative; the EPR-modified Build 155 GUI reads it correctly. GUI axis limits may hide negative current. No samples are interpolated or added, and KM003C's 1 ms timestamp resolution / polling rate are unchanged.
+
+### GoodCRC console display and inferred VBUS events
+
+`capture --hide-goodcrc` hides decoded `GOODCRC` console lines and is the default, matching CY4500/TI capture options. `--show-goodcrc` restores them; `--quiet` suppresses all event lines. Every selected output still retains GoodCRC, and unknown events and framing errors are not filtered. KM003C has no CRC/EOP/idle-error results, so it cannot reproduce CY4500's distinction between valid and error-bearing GoodCRC.
+
+```powershell
+python km003c_cli.py capture --until-ctrl-c --hide-goodcrc --infer-vbus-events --out-prefix captures/vbus01
+python km003c_cli.py capture --seconds 10 --show-goodcrc --out-prefix captures/goodcrc01
+python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus-events --out-prefix captures/vbus_converted
+```
+
+`--infer-vbus-events` is **off by default** and works with capture and offline conversion. It requires measurements (`--scope`, enabled by default) and uses device-timestamped PD status preambles only. The TI-compatible hysteresis emits `VBUS_UP` at 4,000 mV or above after a known low state, and `VBUS_DN` at 800 mV or below after a known high state. Intermediate voltages retain the state. The first sample emits no event; gaps over 100,000 µs, duplicate timestamps, and backward timestamps reset the baseline without emitting an event.
+
+The event time is the first sample after the threshold, with 1 ms device resolution and the polling interval's uncertainty (default 40 ms). It is a software estimate, not a KM003C hardware event; transitions between samples may be missed. Console lines are labeled `[VBUS inferred]`. Selected GUI outputs receive voltage-event rows (`Ok=VBUS_UP/DN`, Utility `VOLT_PKT` adapter), not fabricated PD messages. GUI rows alone cannot distinguish these estimates from hardware VBUS events: share `.vbus_events.jsonl` and metadata with them. The sidecar is always written when inference is enabled, even with `--formats original`, and records `estimated`, source, threshold, sample interval, and GUI row association. `vbus_event_inference` metadata records thresholds, counts, and gap resets; `gui_pd_messages` excludes estimates, while `gui_rows` includes them. Native frames, original JSONL, scope samples, and native PD counts are unchanged.
 
 ## Measurement and offline conversion
 
@@ -88,8 +102,8 @@ KM003C supplies no CRC/EOP result or wire duration: `Ok`, `Duration`, and `Delta
 | `usb-info` | `--json`, device enumeration |
 | `live-status` / `volt-amp` | `--count`, `--interval`, `--median`, `--csv`, `--instant` |
 | `scope` | `--seconds` / `--until-ctrl-c`, `--csv`, `--raw`, `--quiet`, `--interval`, `--instant`, `--stream`, `--rate` |
-| `capture` | `--seconds` / `--until-ctrl-c`, `--out-prefix`, `--scope` / `--no-scope`, `--scope-raw`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--quiet`, `--interval`, `--allow-framing-errors`, `--gui-csv` |
-| `export-gui` / `convert` / `decode` | `--records` / `--input`, `--out-prefix`, `--scope` / `--no-scope`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--allow-framing-errors` |
+| `capture` | `--seconds` / `--until-ctrl-c`, `--out-prefix`, `--scope` / `--no-scope`, `--scope-raw`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--quiet`, `--hide-goodcrc` / `--show-goodcrc`, `--infer-vbus-events`, `--interval`, `--allow-framing-errors`, `--gui-csv` |
+| `export-gui` / `convert` / `decode` | `--records` / `--input`, `--out-prefix`, `--scope` / `--no-scope`, `--ccgx3` / `--no-ccgx3`, `--formats`, `--force`, `--infer-vbus-events`, `--allow-framing-errors` |
 | `adc` | `--count`, `--interval`, `--csv`, `--jsonl`, `--instant` |
 
 Use `<command> --help` for all options. Utility CSV is generated by default by `capture`; `--gui-csv` is accepted for compatibility. `--scope-raw` requires `--scope`. ADC uses device-averaged VBUS/IBUS by default; `--instant` selects instantaneous values.
@@ -119,6 +133,7 @@ Options follow the command: `--transport auto|hid|usb|cdc`, `--serial`, `--vid`,
 | `.scope.xfers.bin` | Same input transfers as `.xfers.bin`, including measurement preambles; with `--scope-raw` |
 | `.summary.txt` | Counts, message statistics, completion status |
 | `.metadata.json` | Connection settings, formats, time sources, resolution, unobserved fields |
+| `.vbus_events.jsonl` | Software VBUS estimates and supporting sample intervals; only with `--infer-vbus-events` |
 
 Live-status CSV has CY4500's 18 columns. Standalone `scope` also writes `<CSV filename>.metadata.json`. Offline export produces the selected CSV/ccgx3/records JSONL/scope CSV plus metadata and summary; it does not rewrite native binary input. Waveforms for offline sessions are reconstructed from saved measurement preambles.
 
@@ -208,7 +223,7 @@ $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
 
 Tests cover synthetic PD packets, ADC example bytes, fragmented reads, timestamp wraparound, signs/units, offline export, raw evidence on decode errors, and ASCII command generation. Reference tests compare column layouts and run CY4500's read-only CSV loaders; they skip if no reference checkout is supplied.
 
-On 2026-10-06, all 42 tests passed with CY4500 reference checks enabled. Local EZ-PD 4.2.0 Build 155 (EPR mod v1.0p) GUI checks confirmed CSV Import, ccgx3 Open, PD details, and waveforms. The stock 4.2.0 CSV parser accepted all 1,881 PD messages in an existing capture; its Java classes deserialized the session's 1,881 packets and 5,674 waveform samples. All graph values matched scope CSV within integer mV/mA rounding. Those local measurements and manufacturer classes are excluded from Git.
+On 2026-10-06, all 50 tests passed with CY4500 reference checks enabled. Local EZ-PD 4.2.0 Build 155 (EPR mod v1.0p) GUI checks confirmed CSV Import, ccgx3 Open, PD details, and waveforms. The stock 4.2.0 CSV parser accepted all 1,881 PD messages in an existing capture; its Java classes deserialized the session's 1,881 packets and 5,674 waveform samples. All graph values matched scope CSV within integer mV/mA rounding. Additional synthetic-data checks confirmed inferred UP/DN rows in CSV Import and ccgx3 Open, row selection and waveform alignment; the stock parser accepted all four rows and its Java classes deserialized four rows and six samples. Those local measurements and manufacturer classes are excluded from Git.
 
 Hardware checks on 2026-10-02 confirmed ADC reading over USB/HID/CDC, USB PD capture, standalone HID scope, and offline replay. HID PD-only requests did not respond on the tested unit. New CDC streaming, electronic loads, and live trigger/voltage changes remain unverified.
 

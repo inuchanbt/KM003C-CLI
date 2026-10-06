@@ -40,6 +40,20 @@ def packet_for_event(event, index):
     return raw, row
 
 
+def packet_for_vbus_event(event, index):
+    """Explicit software voltage-event adapter, using the Utility VOLT_PKT flag."""
+    timestamp = event['timestamp_us']
+    mv = event['vbus_mV']
+    code = 2 if event['event'] == 'VBUS_UP' else 1
+    vbus_raw = max(0, round(mv * 4096 / (4048 * 12)))
+    raw = struct.pack('<IIIII', code, vbus_raw, timestamp & 0xFFFFFFFF,
+                      timestamp & 0xFFFFFFFF, 1 << 26)
+    # Reserved control header is the GUI's voltage-event representation, not PD.
+    row = list(map(str, (index, event['event'], 'SOP', 'C_RSVD0', 0, 'UFP', 'SNK',
+                         0, 'v1', 0, '', mv, '0x0', timestamp, timestamp)))
+    return raw, row
+
+
 def _utf(s):
     b = s.encode('ascii')  # All schema names and exported values are ASCII.
     return struct.pack('>H', len(b)) + b
