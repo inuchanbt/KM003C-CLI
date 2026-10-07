@@ -272,10 +272,18 @@ KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo`
 | `--type` / `--em` / `--sink` | PDM のプロトコル・e-marker 模擬・Sink 能力を変更。AVS の既定は 2/2/1、PPS は 1/1/1 |
 | `--measurement-transport` | ADC 読み取り用の HID（既定）/ USB。トリガーの CDC 接続と併用 |
 | `--csv` / `--no-csv` | 省略時は日時入りの captures/km003c_*_sweep_*.csv を作成 / 保存なし |
-| `--csv-overwrite` / `--csv-append` | 指定 CSV の上書き / 同じ列構成への追記。既定は既存ファイルを拒否 |
+| `--force` / `--csv-overwrite` / `--csv-append` | 前二つは指定 CSV とメタデータを上書き。append は列を検証して追記し、既存メタデータを保持。既定は既存ファイルを拒否 |
 | `--source-name` / `--cable-name` / `--test-note` | ASD 形式の記録用ラベル |
 | `--keep-trigger` | 終了後も最後の PD 要求を維持。既定は無効（reset + pdm close） |
+| `--pause-before-sweep` | 初期化・ADC 接続準備後、最初の電圧要求前に Enter 待ち。既定は無効 |
 | `--quiet` / `--dry-run` | 進捗表示を省略 / 全計画のみ表示 |
+
+PDO 取得中は外部負荷を OFF または低電流にし、本測定の直前に設定したい場合は `--pause-before-sweep` を追加してください。初期化（EPR 能力取得の待機を含む）と ADC 接続の準備が完了した後、最初の掃引要求を送る前に停止します。電子負荷を CC 5 A など目的の電流に設定し、Enter で開始します。`--quiet` でも待機案内は表示します。待機中の Ctrl+C や入力 EOF でも既存の終了処理を実行し、掃引要求は送りません。`--no-initialize` の場合も最初の要求前に停止します。`--dry-run` では停止位置の表示のみで、入力待ちはしません。`--force` は `--csv-overwrite` と同じ指定で、`--csv` が必要です。指定 CSV と `<CSV>.metadata.json` を両方上書きします。
+
+```powershell
+# 低電流／無負荷で PDO を取得 → 待機中に CC 5 A に設定 → Enter で開始。既存ログは上書き
+python km003c_cli.py --port COM14 --mode avs --sweep 15:48:1:5 --pdo-index 11 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --pause-before-sweep --csv captures/avs07.csv --force
+```
 
 `--continuous-sweep` は **KM003C の電子負荷を制御しません**。式の電流は PD 要求電流です。実際の消費電流は接続した外部負荷で決まります。ASD の電子負荷 ON/OFF、初回の負荷電流ランプ、プリチェック関連のオプションは、このコマンドには含めません。
 

@@ -81,12 +81,15 @@ def add_sweep_options(parser, connection_options, positive_float, nonnegative_fl
                         help='open/configure PDM, enter PD and query PDOs; restart PDM if already busy')
     parser.add_argument('--keep-trigger', action=argparse.BooleanOptionalAction, default=False,
                         help='keep the last PD request on exit; default resets and closes PDM')
+    parser.add_argument('--pause-before-sweep', action='store_true',
+                        help='wait for Enter after initialization, before the first voltage request; configure external load manually')
     parser.add_argument('--dry-run', action='store_true', help='print plan; no hardware or files')
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--csv', help='default: unique sweep filename in captures/')
     output.add_argument('--no-csv', action='store_true')
     policy = parser.add_mutually_exclusive_group()
-    policy.add_argument('--csv-overwrite', dest='csv_mode', action='store_const', const='overwrite')
+    policy.add_argument('--csv-overwrite', '--force', dest='csv_mode', action='store_const', const='overwrite',
+                        help='overwrite the selected CSV and its metadata (requires --csv)')
     policy.add_argument('--csv-append', dest='csv_mode', action='store_const', const='append')
     parser.set_defaults(csv_mode='error')
     parser.add_argument('--quiet', action='store_true')
@@ -159,7 +162,7 @@ def build_plan(args):
 def validate_sweep(args):
     build_plan(args)
     if args.csv_mode != 'error' and not args.csv:
-        raise ValueError('--csv-overwrite/--csv-append requires --csv')
+        raise ValueError('--force/--csv-overwrite/--csv-append requires --csv')
 
 
 def _read_reply(transport, seconds, response, *, stop_when=None):
@@ -339,7 +342,7 @@ def _paths(args, kind, started):
         Path('captures') / f'km003c_{kind}_sweep_{started.strftime("%Y%m%d_%H%M%S_%f")}.csv')
     if path.exists():
         if path.is_dir() or args.csv_mode == 'error':
-            raise FileExistsError(f'{path} exists; use another --csv or --csv-overwrite/--csv-append')
+            raise FileExistsError(f'{path} exists; use another --csv or --force/--csv-overwrite/--csv-append')
         if args.csv_mode == 'append':
             with path.open(encoding='utf-8-sig', newline='') as handle:
                 if next(csv.reader(handle), None) != SWEEP_COLUMNS:
@@ -365,6 +368,8 @@ def run_sweep(args, *, version='unknown'):
     if args.dry_run:
         for command in setup:
             print(command)
+        if args.pause_before_sweep:
+            print('Pause before sweep: configure external load, then press Enter (not waiting in dry-run)')
         for index, point in enumerate(points, 1):
             print(f'{index:5d} [{point.leg}] {point.command(args.pdo_index)}')
         print('Exit cleanup: ' + ('keep last request' if args.keep_trigger else 'reset -> pdm close'))
@@ -376,6 +381,7 @@ def run_sweep(args, *, version='unknown'):
     status, error = 'completed', None
     setup_replies = []
     cleanup = None
+    pause = dict(status='not_requested', elapsed_s=0.0)
     sent, completed, rows, last_voltage = 0, 0, 0, None
     origin = time.monotonic()
     with ExitStack() as stack:
@@ -413,6 +419,25 @@ def run_sweep(args, *, version='unknown'):
                 adc_args.command, adc_args.transport, adc_args.port = 'adc', args.measurement_transport, None
                 adc_args.hid_path = None
                 adc = stack.enter_context(Meter(adc_args))
+
+            if args.pause_before_sweep:
+                pause_origin = time.monotonic()
+                pause['status'] = 'waiting'
+                try:
+                    input('Sweep preparation complete. Configure external electronic load '
+                          f'(PD request: {points[0].current_ma / 1000:g} A), '
+                          'then press Enter to start sweep (Ctrl+C to cancel): ')
+                except EOFError as exc:
+                    pause['status'] = 'failed'
+                    raise ProtocolError('--pause-before-sweep requires console input; '
+                                        'no Enter received (EOF)') from exc
+                except KeyboardInterrupt:
+                    pause['status'] = 'interrupted'
+                    raise
+                else:
+                    pause['status'] = 'continued'
+                finally:
+                    pause['elapsed_s'] = time.monotonic() - pause_origin
 
             for index, point in enumerate(points, 1):
                 point_origin = time.monotonic()
@@ -496,7 +521,7 @@ def run_sweep(args, *, version='unknown'):
                             planned_points=len(points), sent_requests=sent, completed_points=completed,
                             rows=rows, last_requested_voltage_V=last_voltage, setup=setup_replies,
                             stop_policy='keep last request' if args.keep_trigger else 'reset then pdm close; external load unchanged',
-                            cleanup=cleanup)
+                            pause_before_sweep=pause, cleanup=cleanup)
                 meta_path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f'Sweep {status}: {completed}/{len(points)} points; {sent} requests sent')
     if path:

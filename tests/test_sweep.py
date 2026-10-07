@@ -81,7 +81,7 @@ class SweepTests(unittest.TestCase):
             'sweep', '--sweep', '15:17:1:5', '--pdo-index', '11',
             '--wait', '.1', '--quiet', '--keep-trigger', *extra])
 
-    def execute(self, args, *, serial=None, meter=None, clock=None):
+    def execute(self, args, *, serial=None, meter=None, clock=None, output=None):
         clock = clock or Clock()
         serial = serial or Serial(clock)
         meter = meter or Meter()
@@ -90,13 +90,135 @@ class SweepTests(unittest.TestCase):
             stack.enter_context(patch.object(sweep.time, 'sleep', clock.sleep))
             stack.enter_context(patch.object(sweep, 'SerialTransport', return_value=serial))
             stack.enter_context(patch.object(sweep, 'Meter', return_value=meter))
-            stack.enter_context(redirect_stdout(io.StringIO()))
+            stack.enter_context(redirect_stdout(output if output is not None else io.StringIO()))
             result = cli.run_sweep(args)
         return result, clock, serial, meter
 
     def rows(self, path):
         with Path(path).open(encoding='utf-8-sig', newline='') as handle:
             return list(csv.DictReader(handle))
+
+    def test_pause_after_epr_and_adc_preparation_before_first_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv'; clock=Clock(); meter=self.release_meter()
+            class EprSerial(Serial):
+                def write(self,data):
+                    super().write(data)
+                    if data==b'pd pdo':
+                        self.pending=[b'AVS: 9-20V3.00A,4.60A\n' if self.writes.count('pd pdo')==1
+                                      else b'AVS: 15.00-48.00V 240W\n']
+            serial=EprSerial(clock)
+            def resume(prompt):
+                self.assertIn('5 A',prompt)
+                self.assertEqual(serial.writes,['pdm open','pdm set type=2,em=2,sink=1',
+                                                'entry pd','pd pdo','pd pdo'])
+                self.assertEqual(meter.reads,0)
+                self.assertIs(sweep.Meter.return_value,meter)
+                self.assertEqual(sweep.Meter.call_count,1)
+                clock.sleep(7)
+                return ''
+            with patch('builtins.input',side_effect=resume) as wait:
+                result,*_=self.execute(self.args('--sweep','15:48:1:5','--continuous-sweep',
+                    '--pause-before-sweep','--csv',str(path),'--no-keep-trigger'),
+                    clock=clock,serial=serial,meter=meter)
+            self.assertEqual(result,0)
+            self.assertEqual(wait.call_count,1)
+            self.assertTrue(serial.writes[5].startswith('pd req='))
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['pause_before_sweep'],dict(status='continued',elapsed_s=7.0))
+            self.assertEqual(info['sent_requests'],34)
+            self.assertEqual(len(self.rows(path)),34)
+
+    def test_quiet_pause_prompt_visible_and_no_init_supported(self):
+        output=io.StringIO();clock=Clock();serial=Serial(clock)
+        with patch('sys.stdin',io.StringIO('\n')):
+            result,*_=self.execute(self.args('--pause-before-sweep','--no-initialize','--no-csv'),
+                                   clock=clock,serial=serial,output=output)
+        self.assertEqual(result,0)
+        self.assertIn('press Enter to start sweep',output.getvalue())
+        self.assertTrue(all(c.startswith('pd req=') for c in serial.writes))
+
+    def test_pause_interrupt_and_eof_release_without_sweep_requests(self):
+        for exception in (KeyboardInterrupt(),EOFError()):
+            with self.subTest(exception=type(exception).__name__), tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)/'run.csv';clock=Clock();serial=Serial(clock);meter=self.release_meter()
+                args=self.args('--pause-before-sweep','--continuous-sweep',
+                               '--no-keep-trigger','--csv',str(path))
+                with patch('builtins.input',side_effect=exception):
+                    if isinstance(exception,KeyboardInterrupt):
+                        result,*_=self.execute(args,clock=clock,serial=serial,meter=meter)
+                        self.assertEqual(result,130)
+                    else:
+                        with self.assertRaisesRegex(ProtocolError,'no Enter received'):
+                            self.execute(args,clock=clock,serial=serial,meter=meter)
+                self.assertEqual(serial.writes[-2:],['reset','pdm close'])
+                self.assertFalse(any(c.startswith('pd req=') for c in serial.writes))
+                self.assertEqual((serial.closes,meter.closes),(1,1))
+                self.assertEqual(self.rows(path),[])
+                info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+                self.assertEqual(info['sent_requests'],0)
+                self.assertEqual(info['pause_before_sweep']['status'],
+                                 'interrupted' if isinstance(exception,KeyboardInterrupt) else 'failed')
+                self.assertEqual(info['cleanup']['status'],'acknowledged')
+
+    def test_pause_not_reached_on_failed_preparation_and_off_by_default(self):
+        with patch('builtins.input',side_effect=AssertionError('unexpected pause')):
+            self.assertFalse(self.args().pause_before_sweep)
+            self.execute(self.args('--no-csv'))
+            clock=Clock();serial=Serial(clock,{'entry pd':b'error: no source\n'})
+            with self.assertRaisesRegex(ProtocolError,'Device rejected entry pd'):
+                self.execute(self.args('--pause-before-sweep','--no-csv'),clock=clock,serial=serial)
+            with patch.object(sweep,'Meter',side_effect=OSError('ADC open failed')):
+                with patch.object(sweep,'SerialTransport',return_value=Serial(clock)), \
+                        patch.object(sweep.time,'monotonic',clock.monotonic), \
+                        patch.object(sweep.time,'sleep',clock.sleep), redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(OSError,'ADC open failed'):
+                        cli.run_sweep(self.args('--pause-before-sweep','--measure','--no-csv'))
+
+    def test_pause_and_force_option_first_dry_run_never_waits_or_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';path.write_text('old log',encoding='utf-8')
+            meta=Path(str(path)+'.metadata.json');meta.write_text('old metadata',encoding='utf-8')
+            output=io.StringIO()
+            with patch('builtins.input',side_effect=AssertionError('input')), \
+                    patch.object(sweep,'SerialTransport',side_effect=AssertionError('hardware')), \
+                    redirect_stdout(output):
+                self.assertEqual(cli.main(['--mode','avs','--sweep','15:17:1:5','--pdo-index','11',
+                    '--pause-before-sweep','--force','--csv',str(path),'--dry-run']),0)
+            text=output.getvalue()
+            self.assertLess(text.index('pd pdo'),text.index('Pause before sweep'))
+            self.assertLess(text.index('Pause before sweep'),text.index('pd req='))
+            self.assertEqual(path.read_text(encoding='utf-8'),'old log')
+            self.assertEqual(meta.read_text(encoding='utf-8'),'old metadata')
+
+    def test_force_overwrites_csv_and_matching_metadata(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';path.write_text('old log',encoding='utf-8')
+            meta=Path(str(path)+'.metadata.json');meta.write_text('old metadata',encoding='utf-8')
+            args=self.args('--csv',str(path),'--force','--test-note','replacement')
+            self.assertEqual(args.csv_mode,'overwrite')
+            self.execute(args)
+            self.assertEqual(len(self.rows(path)),3)
+            self.assertTrue(all(row['test_note']=='replacement' for row in self.rows(path)))
+            self.assertEqual(path.read_bytes().count(bytes.fromhex('efbbbf')),1)
+            info=json.loads(meta.read_text(encoding='utf-8'))
+            self.assertEqual(info['arguments']['csv_mode'],'overwrite')
+            self.assertEqual(info['sent_requests'],3)
+            self.assertEqual(list(Path(folder).glob('*.run_*.metadata.json')),[])
+
+    def test_force_requires_csv_and_rejects_append_and_directories(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(['--sweep','15:17:1:5','--pdo-index','11','--force'])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args('--csv','run.csv','--force','--csv-append')
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+                sweep,'SerialTransport',side_effect=AssertionError('hardware')):
+            path=Path(folder)/'run.csv';path.mkdir()
+            with self.assertRaises(FileExistsError):
+                cli.run_sweep(self.args('--csv',str(path),'--force'))
+            path.rmdir();Path(str(path)+'.metadata.json').mkdir()
+            with self.assertRaises(FileExistsError):
+                cli.run_sweep(self.args('--csv',str(path),'--force'))
 
     def test_full_avs_roundtrip_and_descending(self):
         p = sweep.build_plan(self.args('--sweep', '15:48:1:5', '--round-trip-sweep'))
