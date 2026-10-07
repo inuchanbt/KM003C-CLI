@@ -249,7 +249,7 @@ python km003c_cli.py --port COM3 --pps-sweep 5:21:1:3 --pdo-index 6 --continuous
 python km003c_cli.py --mode avs --sweep 15:48:1:5 --pdo-index 11 --round-trip-sweep --dry-run
 ```
 
-通常は開始時に `pdm open` → `entry pd` → `pd pdo` を一度送ります。`entry pd` の `ready` 応答が得られなければ掃引を開始しません。すでに準備済みなら `--no-initialize`。`pdm set` は自動送信しないので、必要な `type/em/sink` 設定は既存の `pdm set` で行ってください。
+通常は開始時に `pdm open` → `entry pd` → `pd pdo` を一度送ります。`entry pd` の `ready` 応答を最大10秒待ち、受信後すぐに先へ進みます。掃引前に PDO を別途取得する必要はありません。`--entry-timeout` で初期化待ち時間を変更でき、各電圧要求の待ち時間には影響しません。`ready` が返らない場合は電源・CC 接続と PDM 設定を確認してください。すでに準備済みなら `--no-initialize`。`pdm set` は自動送信しないので、必要な `type/em/sink` 設定は既存の `pdm set` で行ってください。
 
 KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo` の機械処理用の応答形式がないため、PDO 種別・対応電圧・電流の自動選択は行いません。既存の `pd --pdo` で接続先を確認し、範囲全体をカバーする PPS/AVS PDO を選んでください。Fixed PDO ではメーカー仕様上 `volt` が無視されるため、掃引には使えません。実際の要求は `pd req=N,volt=mV,cur=mA` に変換します。
 
@@ -264,7 +264,8 @@ KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo`
 | `--apdo-voltage-hold` | 各点の最低保持時間。既定 0 秒。応答待ち・測定時間を含む |
 | `--measure` / `--measure-loop` | 1 回 / 指定回数の ADC 読み取り。既定 off / 0。continuous 時は最低 1 回 |
 | `--delay` | 測定前の待ち。既定 0.5 秒。continuous の初回は continuous-settle を使う |
-| `--wait` | KM 固有の ASCII 応答読み取り時間。既定 1 秒 |
+| `--wait` | entry pd 以外の KM 固有 ASCII 応答読み取り時間。既定 1 秒 |
+| `--entry-timeout` | 初期化時の entry pd ready 待ち上限。既定 10 秒 |
 | `--measurement-transport` | ADC 読み取り用の HID（既定）/ USB。トリガーの CDC 接続と併用 |
 | `--csv` / `--no-csv` | 省略時は日時入りの captures/km003c_*_sweep_*.csv を作成 / 保存なし |
 | `--csv-overwrite` / `--csv-append` | 指定 CSV の上書き / 同じ列構成への追記。既定は既存ファイルを拒否 |

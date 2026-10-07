@@ -63,7 +63,9 @@ def add_sweep_options(parser, connection_options, positive_float, nonnegative_fl
     parser.add_argument('--delay', type=nonnegative_float, default=0.5)
     parser.add_argument('--measurement-transport', choices=['hid', 'usb'], default='hid')
     parser.add_argument('--wait', type=positive_float, default=1.0,
-                        help='ASCII reply read window in seconds (included in hold)')
+                        help='ASCII reply read window in seconds (included in hold; excludes entry pd)')
+    parser.add_argument('--entry-timeout', type=positive_float, default=10.0,
+                        help='maximum seconds to wait for entry pd ready (default: 10)')
     parser.add_argument('--initialize', action=argparse.BooleanOptionalAction, default=True,
                         help='send pdm open / entry pd / pd pdo once before sweeping')
     parser.add_argument('--dry-run', action='store_true', help='print plan; no hardware or files')
@@ -147,17 +149,23 @@ def validate_sweep(args):
         raise ValueError('--csv-overwrite/--csv-append requires --csv')
 
 
-def _read_reply(transport, seconds, response):
+def _read_reply(transport, seconds, response, *, stop_when=None):
     deadline = time.monotonic() + seconds
     while (remaining := deadline - time.monotonic()) > 0:
         response.extend(transport.read(min(.05, remaining)))
         if len(response) > 1024 * 1024:
             raise ProtocolError('ASCII reply exceeds size limit')
+        if stop_when is not None and stop_when(response):
+            break
 
 
 def _rejects(response):
     return bool(re.search(r'^\s*(?:error|fail(?:ed|ure)?|false|nak|reject(?:ed)?|invalid|unsupported)\b',
                           response.decode('utf-8', errors='replace'), re.I | re.M))
+
+
+def _ready(response):
+    return bool(re.search(rb'(?:^|[\r\n:>])\s*ready\b', response, re.I))
 
 
 def _paths(args, kind, started):
@@ -242,18 +250,27 @@ def run_sweep(args, *, version='unknown'):
                 response = bytearray()
                 entry = {'command': command}
                 setup_replies.append(entry)
+                if not args.quiet:
+                    print(command, flush=True)
                 try:
                     serial.write(command.encode('ascii') + b'\r\n')
-                    _read_reply(serial, args.wait, response)
+                    if command == 'entry pd':
+                        # Negotiation can outlast a normal command reply. Wait passively;
+                        # resending entry pd could restart the device's negotiation.
+                        _read_reply(serial, args.entry_timeout, response,
+                                    stop_when=lambda data: _rejects(data) or _ready(data))
+                    else:
+                        _read_reply(serial, args.wait, response)
                 finally:
                     entry['response_hex'] = response.hex(' ')
                 if not args.quiet:
-                    print(command)
                     print(response.decode('utf-8', errors='replace').strip() or '(no reply)')
                 if _rejects(response):
                     raise ProtocolError(f'Device rejected {command}')
-                if command == 'entry pd' and not re.search(rb'(?:^|[\r\n:>])\s*ready\b', response, re.I):
-                    raise ProtocolError('entry pd did not reply ready; increase --wait or establish PD first')
+                if command == 'entry pd' and not _ready(response):
+                    raise ProtocolError(
+                        f'entry pd did not reply ready within {args.entry_timeout:g}s; '
+                        'check source/CC connection and PDM settings, or increase --entry-timeout')
 
             for index, point in enumerate(points, 1):
                 point_origin = time.monotonic()

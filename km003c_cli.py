@@ -29,7 +29,7 @@ from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUF
 
 from km003c_modules.sweep import add_sweep_options, validate_sweep, run_sweep as execute_sweep
 
-VERSION = '0.5.0'
+VERSION = '0.5.1'
 
 
 def positive_float(text):

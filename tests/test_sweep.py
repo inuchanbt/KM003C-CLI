@@ -155,6 +155,7 @@ class SweepTests(unittest.TestCase):
         self.assertFalse(a.continuous_sweep)
         self.assertFalse(a.measure)
         self.assertEqual(a.csv_mode,'error')
+        self.assertEqual(a.entry_timeout,10.0)
 
     def test_single_serial_session_and_unverified_request_log(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -244,6 +245,54 @@ class SweepTests(unittest.TestCase):
             info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
             self.assertEqual(info['status'],'failed')
             self.assertEqual(info['sent_requests'],0)
+
+    def test_delayed_split_ready_waits_then_queries_pdo_without_resending(self):
+        clock=Clock()
+        # More than the old 1 s cutoff, followed by fragmented ready bytes.
+        serial=Serial(clock,{'entry pd':[b'']*24+[b'rea',b'dy\r\n']})
+        result,*_=self.execute(self.args('--no-csv'),clock=clock,serial=serial)
+        self.assertEqual(result,0)
+        self.assertEqual(serial.writes[:3],['pdm open','entry pd','pd pdo'])
+        self.assertEqual(serial.writes.count('entry pd'),1)
+        # Ready ends initialization early; per-target reply windows remain .1 s.
+        self.assertAlmostEqual(clock.now,.1+1.3+.1+3*.1)
+        self.assertEqual(serial.closes,1)
+
+    def test_empty_entry_reply_times_out_before_pdo_or_voltage_requests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv'; clock=Clock()
+            serial=Serial(clock,{'entry pd':b''})
+            with self.assertRaisesRegex(ProtocolError,'within 2s.*--entry-timeout'):
+                self.execute(self.args('--csv',str(path),'--entry-timeout','2'),
+                             clock=clock,serial=serial)
+            self.assertAlmostEqual(clock.now,2.1)
+            self.assertEqual(serial.writes,['pdm open','entry pd'])
+            self.assertEqual(serial.closes,1)
+            self.assertEqual(self.rows(path),[])
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['setup'][-1]['response_hex'],'')
+            self.assertEqual(info['sent_requests'],0)
+
+    def test_entry_rejection_stops_wait_early(self):
+        clock=Clock(); serial=Serial(clock,{'entry pd':b'error: no source\r\n'})
+        with self.assertRaisesRegex(ProtocolError,'Device rejected entry pd'):
+            self.execute(self.args('--no-csv'),clock=clock,serial=serial)
+        self.assertAlmostEqual(clock.now,.15)
+        self.assertEqual(serial.writes,['pdm open','entry pd'])
+        self.assertEqual(serial.closes,1)
+
+    def test_entry_interrupt_preserves_partial_reply_without_requests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv'; clock=Clock()
+            serial=Serial(clock,{'entry pd':[b'rea',KeyboardInterrupt()]})
+            result,*_=self.execute(self.args('--csv',str(path)),clock=clock,serial=serial)
+            self.assertEqual(result,130)
+            self.assertEqual(serial.writes,['pdm open','entry pd'])
+            self.assertEqual(serial.closes,1)
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['status'],'interrupted')
+            self.assertEqual(info['sent_requests'],0)
+            self.assertEqual(bytes.fromhex(info['setup'][-1]['response_hex']),b'rea')
 
     def test_rejection_stops_and_preserves_reply(self):
         with tempfile.TemporaryDirectory() as folder:

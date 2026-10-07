@@ -249,7 +249,7 @@ python km003c_cli.py --port COM3 --pps-sweep 5:21:1:3 --pdo-index 6 --continuous
 python km003c_cli.py --mode avs --sweep 15:48:1:5 --pdo-index 11 --round-trip-sweep --dry-run
 ```
 
-By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It requires a `ready` reply to `entry pd` before sweeping. Use `--no-initialize` for an already prepared trigger. The command does not send `pdm set` automatically; configure `type/em/sink` separately with existing `pdm set` commands when needed.
+By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It waits up to 10 seconds for a `ready` reply to `entry pd` and proceeds as soon as it arrives. A separate PDO query before the sweep is not required. `--entry-timeout` changes this initialization timeout; it does not lengthen each voltage request. If no `ready` arrives, check the source/CC connection and PDM settings before retrying. Use `--no-initialize` for an already prepared trigger. The command does not send `pdm set` automatically; configure `type/em/sink` separately with existing `pdm set` commands when needed.
 
 **KM003C requires `--pdo-index`.** The vendor does not document a machine-readable `pd pdo` reply, so the command does not automatically select or validate a source's PDO type/voltage/current range. Inspect it with `pd --pdo` and choose a PPS/AVS PDO covering the entire range. Fixed PDOs ignore the voltage parameter and cannot sweep. Each target becomes `pd req=N,volt=mV,cur=mA`.
 
@@ -264,7 +264,8 @@ By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It requ
 | `--apdo-voltage-hold` | Minimum time per target, including reply/measurement time; 0 s |
 | `--measure` / `--measure-loop` | One / N ADC reads; off / 0; continuous mode takes at least one |
 | `--delay` | Measurement delay; 0.5 s; continuous first read uses continuous-settle |
-| `--wait` | KM-specific ASCII reply read window; 1 s |
+| `--wait` | KM-specific ASCII reply read window except entry pd; 1 s |
+| `--entry-timeout` | Maximum wait for entry pd ready during initialization; 10 s |
 | `--measurement-transport` | HID (default) / USB ADC interface alongside CDC trigger control |
 | `--csv` / `--no-csv` | Default: unique captures/km003c_*_sweep_*.csv / disable output |
 | `--csv-overwrite` / `--csv-append` | Replace explicitly selected CSV / append after header validation; default refuses existing files |
