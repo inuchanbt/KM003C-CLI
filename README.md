@@ -231,7 +231,51 @@ These commands send manufacturer ASCII commands through CDC and can change volta
 | `scp`, `vfcp` | `--volt`, `--cur` |
 | `reset` | Reset the trigger module |
 
-`--voltage` is V, `--volt` is mV, and `--cur` is the manufacturer's integer current parameter. Fixed PD PDO requests may omit `--volt`. Supported voltages/currents depend on the source and firmware. `pd --data` takes SOP + a two-byte little-endian header + four-byte objects, without CRC; the device may rewrite MessageID and roles. Commands run separately; opening PDM, entering a protocol, and requesting voltage are not chained automatically.
+`--voltage` is V, `--volt` is mV, and `--cur` is the manufacturer's integer current parameter. Fixed PD PDO requests may omit `--volt`. Supported voltages/currents depend on the source and firmware. `pd --data` takes SOP + a two-byte little-endian header + four-byte objects, without CRC; the device may rewrite MessageID and roles. These individual commands run separately; the sweep command below has its own initialization sequence.
+
+## PPS/AVS voltage sweeps (ASD-style options)
+
+Use the same `--mode avs --sweep start:end:step[:current]`, `--pps-sweep`, and `--round-trip-sweep` notation as `asd_pd31_cli.py`. Voltages are in **V**, currents in **A**. Option-first invocation, the explicit `sweep` subcommand, and its `load` alias are supported.
+
+```powershell
+# AVS: 15 -> 48 -> 15 V, 1 V steps, 5 A requested, 67 points
+# Change --pdo-index to the connected source's PPS/AVS ObjectPosition
+python km003c_cli.py --port COM3 --mode avs --sweep 15:48:1:5 --pdo-index 11 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --csv captures/avs_sweep.csv
+
+# PPS: 5 -> 21 -> 5 V, 3 A requested
+python km003c_cli.py --port COM3 --pps-sweep 5:21:1:3 --pdo-index 6 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --csv captures/pps_sweep.csv
+
+# Print every request without opening hardware or writing files
+python km003c_cli.py --mode avs --sweep 15:48:1:5 --pdo-index 11 --round-trip-sweep --dry-run
+```
+
+By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It requires a `ready` reply to `entry pd` before sweeping. Use `--no-initialize` for an already prepared trigger. The command does not send `pdm set` automatically; configure `type/em/sink` separately with existing `pdm set` commands when needed.
+
+**KM003C requires `--pdo-index`.** The vendor does not document a machine-readable `pd pdo` reply, so the command does not automatically select or validate a source's PDO type/voltage/current range. Inspect it with `pd --pdo` and choose a PPS/AVS PDO covering the entire range. Fixed PDOs ignore the voltage parameter and cannot sweep. Each target becomes `pd req=N,volt=mV,cur=mA`.
+
+| Option | Behavior / default |
+| --- | --- |
+| `--sweep start:end:step[:current]` | AVS; omitted current requires --request-current |
+| `--pps-sweep start:end:step[:current]` | PPS; omitted current defaults to 1 A |
+| `--request-current` | A; overrides expression current |
+| `--round-trip-sweep` | Return leg without a duplicate turn-around target; descending ranges use negative step |
+| `--continuous-sweep` | Retain the PDO/request current and measure each point |
+| `--continuous-settle` | Delay before the first continuous measurement; 0.5 s |
+| `--apdo-voltage-hold` | Minimum time per target, including reply/measurement time; 0 s |
+| `--measure` / `--measure-loop` | One / N ADC reads; off / 0; continuous mode takes at least one |
+| `--delay` | Measurement delay; 0.5 s; continuous first read uses continuous-settle |
+| `--wait` | KM-specific ASCII reply read window; 1 s |
+| `--measurement-transport` | HID (default) / USB ADC interface alongside CDC trigger control |
+| `--csv` / `--no-csv` | Default: unique captures/km003c_*_sweep_*.csv / disable output |
+| `--csv-overwrite` / `--csv-append` | Replace explicitly selected CSV / append after header validation; default refuses existing files |
+| `--source-name` / `--cable-name` / `--test-note` | ASD-style recording labels |
+| `--quiet` / `--dry-run` | Suppress progress / print the plan only |
+
+`--continuous-sweep` **does not control an electronic load**. Expression current is the PD request; the external load determines actual consumption. ASD electronic-load ON/OFF, initial load ramps, and load precheck options are omitted.
+
+Sweep CSV uses common ASD fields such as `target_voltage_v`, `request_current_a`, `actual_voltage_v`, `actual_current_a`, `sweep_leg`, and `sweep_pass`, plus KM command/response/status fields. Load targets remain blank. It is a **sweep-specific subset**, not the complete ASD CSV schema or the EZ-PD capture CSV format. Metadata is stored as `<CSV>.metadata.json`; append runs preserve previous metadata and add `<CSV>.run_<timestamp>.metadata.json`.
+
+Ctrl+C preserves partial request/reply evidence and closes the host connections. No automatic `reset` or `pdm close` is sent; subsequent source state depends on the device's state machine. Empty replies do not mean success: rows remain `sent_unverified`. Reply lines starting with error/failed/false/reject stop the sweep; other reply formats remain unverified. ADC readings describe held targets; use `capture` for PD transition waveform timing. **Live voltage sweeps and concurrent CDC trigger + HID/USB ADC access are not hardware-verified.**
 
 ## Development and verification
 
@@ -253,10 +297,14 @@ Manufacturer documents/demo binaries and measurement files are **not distributed
 # Optional: directory containing your separate CY4500 checkout's
 # cy4500_cli.py and ezpd_protocol.py; enables three reference compatibility tests.
 $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
+# Optional: compare ASD sweep routes, defaults and common columns.
+$env:ASD_PD31_CLI_ROOT = 'D:\ASD-PD31\src\current'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 Tests cover synthetic PD packets, ADC example bytes, fragmented reads, timestamp wraparound, signs/units, offline export, raw evidence on decode errors, ASCII command generation, capture defaults, and AVS transition analysis. Reference tests compare column layouts, read-only CSV loading, and analysis results with CY4500; they skip if no reference checkout is supplied.
+
+On 2026-10-07, all 86 tests passed with ASD/CY reference checks enabled. Sweep tests cover return-leg ordering, decimal steps, common defaults, dry-run isolation, interruption/rejection/ADC-failure evidence, output collisions, and CSV append behavior.
 
 On 2026-10-06, all 65 tests passed with CY4500 reference checks enabled. Local EZ-PD 4.2.0 Build 155 (EPR mod v1.0p) GUI checks confirmed CSV Import, ccgx3 Open, PD details, and waveforms. The stock 4.2.0 CSV parser accepted all 1,881 PD messages in an existing capture; its Java classes deserialized the session's 1,881 packets and 5,674 waveform samples. All graph values matched scope CSV within integer mV/mA rounding. Additional synthetic-data checks confirmed inferred UP/DN rows in CSV Import and ccgx3 Open, row selection and waveform alignment; the stock parser accepted all four rows and its Java classes deserialized four rows and six samples. Those local measurements and manufacturer classes are excluded from Git.
 

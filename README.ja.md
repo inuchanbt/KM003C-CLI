@@ -231,7 +231,51 @@ CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプ
 | `scp`、`vfcp` | `--volt`、`--cur` |
 | `reset` | トリガーモジュールをリセット |
 
-`--voltage` は V、`--volt` は mV、`--cur` はメーカー資料の電流パラメータを整数で送ります。PD の固定 PDO は `--volt` を省略できます。対応する電圧・電流は接続先とファームウェアに依存します。`pd --data` は SOP + 2-byte little-endian ヘッダー + 4-byte オブジェクトを受け取り、CRC は付けません。MessageID や役割はデバイスが書き換える場合があります。各コマンドは個別実行し、PDM 開始・プロトコル移行・電圧要求を自動で連続実行しません。
+`--voltage` は V、`--volt` は mV、`--cur` はメーカー資料の電流パラメータを整数で送ります。PD の固定 PDO は `--volt` を省略できます。対応する電圧・電流は接続先とファームウェアに依存します。`pd --data` は SOP + 2-byte little-endian ヘッダー + 4-byte オブジェクトを受け取り、CRC は付けません。MessageID や役割はデバイスが書き換える場合があります。上記の単発コマンドは個別に実行します。以下の掃引コマンドは専用の初期化手順を持ちます。
+
+## PPS／AVS 電圧掃引（ASD 形式）
+
+`asd_pd31_cli.py` と同じ `--mode avs --sweep start:end:step[:current]`、`--pps-sweep`、`--round-trip-sweep` を使えます。電圧は **V**、電流は **A**。オプションから始める書き方に加え、`sweep` サブコマンドと `load` エイリアスも使えます。
+
+```powershell
+# AVS：15 → 48 → 15 V、1 V 刻み、要求 5 A、67 点
+# --pdo-index は接続先の PPS/AVS PDO 番号に合わせて変更
+python km003c_cli.py --port COM3 --mode avs --sweep 15:48:1:5 --pdo-index 11 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --csv captures/avs_sweep.csv
+
+# PPS：5 → 21 → 5 V、要求 3 A
+python km003c_cli.py --port COM3 --pps-sweep 5:21:1:3 --pdo-index 6 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --csv captures/pps_sweep.csv
+
+# 実機に接続せず、全要求と往復順序を確認
+python km003c_cli.py --mode avs --sweep 15:48:1:5 --pdo-index 11 --round-trip-sweep --dry-run
+```
+
+通常は開始時に `pdm open` → `entry pd` → `pd pdo` を一度送ります。`entry pd` の `ready` 応答が得られなければ掃引を開始しません。すでに準備済みなら `--no-initialize`。`pdm set` は自動送信しないので、必要な `type/em/sink` 設定は既存の `pdm set` で行ってください。
+
+KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo` の機械処理用の応答形式がないため、PDO 種別・対応電圧・電流の自動選択は行いません。既存の `pd --pdo` で接続先を確認し、範囲全体をカバーする PPS/AVS PDO を選んでください。Fixed PDO ではメーカー仕様上 `volt` が無視されるため、掃引には使えません。実際の要求は `pd req=N,volt=mV,cur=mA` に変換します。
+
+| オプション | 動作・既定値 |
+| --- | --- |
+| `--sweep start:end:step[:current]` | AVS。電流省略時は `--request-current` が必要 |
+| `--pps-sweep start:end:step[:current]` | PPS。電流省略時は 1 A |
+| `--request-current` | A。式の電流を上書き |
+| `--round-trip-sweep` | 往復。折り返し点は重複しない。下降は負の step |
+| `--continuous-sweep` | PDO・要求電流を維持し、各点で ADC を測定 |
+| `--continuous-settle` | 各要求後の測定前待ち。既定 0.5 秒 |
+| `--apdo-voltage-hold` | 各点の最低保持時間。既定 0 秒。応答待ち・測定時間を含む |
+| `--measure` / `--measure-loop` | 1 回 / 指定回数の ADC 読み取り。既定 off / 0。continuous 時は最低 1 回 |
+| `--delay` | 測定前の待ち。既定 0.5 秒。continuous の初回は continuous-settle を使う |
+| `--wait` | KM 固有の ASCII 応答読み取り時間。既定 1 秒 |
+| `--measurement-transport` | ADC 読み取り用の HID（既定）/ USB。トリガーの CDC 接続と併用 |
+| `--csv` / `--no-csv` | 省略時は日時入りの captures/km003c_*_sweep_*.csv を作成 / 保存なし |
+| `--csv-overwrite` / `--csv-append` | 指定 CSV の上書き / 同じ列構成への追記。既定は既存ファイルを拒否 |
+| `--source-name` / `--cable-name` / `--test-note` | ASD 形式の記録用ラベル |
+| `--quiet` / `--dry-run` | 進捗表示を省略 / 全計画のみ表示 |
+
+`--continuous-sweep` は **KM003C の電子負荷を制御しません**。式の電流は PD 要求電流です。実際の消費電流は接続した外部負荷で決まります。ASD の電子負荷 ON/OFF、初回の負荷電流ランプ、プリチェック関連のオプションは、このコマンドには含めません。
+
+CSV は ASD と共通の `target_voltage_v`、`request_current_a`、`actual_voltage_v`、`actual_current_a`、`sweep_leg`、`sweep_pass` などに、KM の要求文・応答生バイト・状態を追加した**掃引用の列構成**です。電子負荷の目標値は空欄で、ASD の全 CSV 列との完全一致ではありません。`capture` の EZ-PD 用 CSV とは別形式です。メタデータは `<CSV>.metadata.json`、追記時は既存情報を残すため `<CSV>.run_<日時>.metadata.json` に保存します。
+
+Ctrl+C は途中の要求・応答・CSV を残して COM/ADC 接続を閉じます。自動の `reset` や `pdm close` は送らないため、終了後の電源状態は機器の状態機械に従います。空の応答は成功扱いにせず、CSV は `sent_unverified` と記録します。行頭の error / failed / false / reject 応答では停止し、その他の応答形式は未確認として保持します。ADC は保持中の測定値で、PD 遷移波形の時間解析には `capture` を使ってください。**掃引の電圧変更と、CDC トリガー＋HID/USB ADC の同時利用は実機未検証です。**
 
 ## 構成と検証
 
@@ -253,10 +297,14 @@ LICENSE               MIT ライセンス
 # 任意：別途取得した CY4500 ソースのうち、cy4500_cli.py と
 # ezpd_protocol.py があるフォルダを指定すると、参照互換性テスト 3 件も実行。
 $env:CY4500_CLI_ROOT = 'C:\path\to\cy4500-cli\CLI'
+# 任意：ASD の掃引経路・既定値・共通列を比較。
+$env:ASD_PD31_CLI_ROOT = 'D:\ASD-PD31\src\current'
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 合成 PD パケット・ADC の例示バイト列を使い、分割受信、時刻折り返し、符号・単位、再変換、エラー時の生データ保持、ASCII コマンド生成、キャプチャの既定動作、AVS 遷移解析を検証します。参照テストは CY4500 の列構成・読み取り専用 CSV ローダー・解析結果と比較し、参照ソース未指定時はスキップします。
+
+2026-10-07 に ASD/CY 参照チェックを含む 86 件のテストが通りました。追加の掃引テストは往復順序、十進刻み、共通設定、ドライラン、中断・拒否・ADC 失敗時の生データ保持、CSV の衝突防止と追記を検証します。
 
 2026-10-06 に CY4500 参照チェックを含む 65 件のテストが通りました。ローカルの EZ-PD 4.2.0 Build 155（EPR 改造版 v1.0p）で CSV Import、ccgx3 Open、PD 詳細、波形を確認しました。メーカー版 4.2.0 の CSV パーサーも既存キャプチャの PD 1,881 件をすべて受理し、メーカーの Java クラスでセッションの PD 1,881 件・波形 5,674 点を読み込めました。全波形の値は整数 mV / mA の丸め幅以内で scope CSV と一致しました。追加の合成データでは、推定 UP/DN の CSV Import・ccgx3 Open・行選択と波形位置の一致も確認しました。メーカー版パーサーは全 4 行を受理し、Java クラスは 4 行・6 測定点を読み込めました。検証用の測定データ・メーカーのクラスは Git に含めません。
 

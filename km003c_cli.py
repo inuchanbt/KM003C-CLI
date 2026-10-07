@@ -27,7 +27,9 @@ from km003c_modules.vbus_events import VbusEventDetector
 from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUFFIXES,
     add_analysis_options, run_analysis, load_analysis_csv, print_analysis_outputs)
 
-VERSION = '0.4.0'
+from km003c_modules.sweep import add_sweep_options, validate_sweep, run_sweep as execute_sweep
+
+VERSION = '0.5.0'
 
 
 def positive_float(text):
@@ -204,6 +206,10 @@ def build_arg_parser():
     add_analysis_options(p, positive_float, nonnegative_float, positive_int)
     p.set_defaults(func=run_analyze_sync)
 
+    p = sub.add_parser('sweep', aliases=['load'], help='ASD-style PPS/AVS voltage sweep')
+    add_sweep_options(p, connection_options, positive_float, nonnegative_float, positive_int, nonnegative_int)
+    p.set_defaults(func=run_sweep)
+
     p = sub.add_parser('pdm', help='open/close/configure the fast-charge trigger module')
     p.add_argument('action', choices=['open', 'close', 'set'])
     p.add_argument('--type', type=int, choices=[0, 1, 2, 3], help='0:auto, 1:PD3.0, 2:PD3.1, 3:private PPS')
@@ -303,6 +309,10 @@ def build_ascii_command(args):
     if name == 'vfcp' and not 7000 <= args.volt <= 20000:
         raise ValueError('VFCP voltage must be 7000..20000 mV')
     return f'{name} volt={args.volt},cur={args.cur}'
+
+
+def run_sweep(args):
+    return execute_sweep(args, version=VERSION)
 
 
 def open_output(stack, path, *, binary=False, bom=True):
@@ -870,6 +880,11 @@ def validate_args(args, parser):
             build_ascii_command(args)
         except ValueError as exc:
             parser.error(str(exc))
+    if args.func is run_sweep:
+        try:
+            validate_sweep(args)
+        except ValueError as exc:
+            parser.error(str(exc))
     # Avoid collisions between independently written user-selected outputs.
     paths = [getattr(args, key, None) for key in ('csv', 'raw', 'jsonl')]
     if args.command == 'scope':
@@ -884,6 +899,11 @@ def main(argv=None):
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8', errors='replace')
     parser = build_arg_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Accept ASD's option-first sweep form alongside KM's explicit subcommand.
+    if argv and argv[0].startswith('-') and any(
+            token.split('=', 1)[0] in ('--sweep', '--pps-sweep') for token in argv):
+        argv.insert(0, 'sweep')
     args = parser.parse_args(argv)
     validate_args(args, parser)
     try:
