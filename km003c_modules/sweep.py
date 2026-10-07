@@ -15,7 +15,7 @@ import re
 import time
 
 from .protocol import ADC, ProtocolError, decode_adc, logical_packets
-from .transport import Meter, SerialTransport
+from .transport import Meter, SerialTransport, encode_ascii_command, format_ascii_response
 
 
 SWEEP_COLUMNS = [
@@ -66,8 +66,16 @@ def add_sweep_options(parser, connection_options, positive_float, nonnegative_fl
                         help='ASCII reply read window in seconds (included in hold; excludes entry pd)')
     parser.add_argument('--entry-timeout', type=positive_float, default=10.0,
                         help='maximum seconds to wait for entry pd ready (default: 10)')
+    parser.add_argument('--pdm-startup-wait', type=nonnegative_float, default=2.0,
+                        help='minimum PDM startup reply window in seconds (default: 2)')
+    parser.add_argument('--type', type=int, choices=[0,1,2,3],
+                        help='PDM protocol: default PD3.1 for AVS, PD3.0 for PPS')
+    parser.add_argument('--em', type=int, choices=[0,1,2],
+                        help='e-marker simulation: 0 off, 1 20V5A, 2 EPR; default 2 AVS / 1 PPS')
+    parser.add_argument('--sink', type=int, choices=[0,1], default=1,
+                        help='Sink capabilities: 0 3A PPS, 1 5A PPS (default)')
     parser.add_argument('--initialize', action=argparse.BooleanOptionalAction, default=True,
-                        help='send pdm open / entry pd / pd pdo once before sweeping')
+                        help='open/configure PDM, enter PD and query PDOs; restart PDM if already busy')
     parser.add_argument('--dry-run', action='store_true', help='print plan; no hardware or files')
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--csv', help='default: unique sweep filename in captures/')
@@ -168,6 +176,81 @@ def _ready(response):
     return bool(re.search(rb'(?:^|[\r\n:>])\s*ready\b', response, re.I))
 
 
+def initialization_commands(args):
+    if not args.initialize:
+        return []
+    protocol_type = args.type if args.type is not None else (1 if args.pps_sweep else 2)
+    em = args.em if args.em is not None else (1 if args.pps_sweep else 2)
+    return ['pdm open', f'pdm set type={protocol_type},em={em},sink={args.sink}',
+            'entry pd', 'pd pdo']
+
+
+def initialize_trigger(serial, args, setup_replies):
+    """Configure the trigger explicitly and retain each setup exchange."""
+    def exchange(command, seconds=None):
+        response = bytearray()
+        entry = {'command': command}
+        setup_replies.append(entry)
+        if not args.quiet:
+            print(command, flush=True)
+        try:
+            serial.write(encode_ascii_command(command))
+            if command == 'entry pd':
+                _read_reply(serial, args.entry_timeout, response,
+                            stop_when=lambda data: _rejects(data) or _ready(data))
+            else:
+                window = seconds if seconds is not None else (
+                    max(args.wait, args.pdm_startup_wait) if command == 'pdm open' else args.wait)
+                _read_reply(serial, window, response)
+        finally:
+            entry['response_hex'] = response.hex(' ')
+        if not args.quiet:
+            print(format_ascii_response(response) or '(no reply)')
+        if _rejects(response):
+            raise ProtocolError(f'Device rejected {command}')
+        return response
+
+    def busy(response):
+        return bool(re.search(rb'^\s*pdm busy\s*$', response, re.I | re.M))
+
+    points = build_plan(args)
+    voltage_min = min(p.voltage_mv for p in points)
+    voltage_max = max(p.voltage_mv for p in points)
+    needs_epr_avs = not args.pps_sweep and voltage_max > 20000
+
+    def epr_avs_ready(response):
+        # The first ready can precede EPR entry. The textual pd pdo reply
+        # exposes ranges while omitting reserved PDO slots; do not infer indices.
+        ranges = re.findall(rb'^AVS:\s*(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)V',
+                            response, re.M | re.I)
+        return any(Decimal(low.decode('ascii')) * 1000 <= voltage_min and
+                   Decimal(high.decode('ascii')) * 1000 >= voltage_max
+                   for low, high in ranges)
+
+    for command in initialization_commands(args):
+        response = exchange(command)
+        if command == 'pdm open' and busy(response):
+            # --initialize requests a fresh negotiation. A running trigger must
+            # be closed before reopening; preserve it with --no-initialize.
+            exchange('pdm close')
+            response = exchange('pdm open')
+            if busy(response):
+                raise ProtocolError('PDM remained busy after close/open; check the device trigger state')
+        if command == 'pd pdo' and needs_epr_avs:
+            deadline = time.monotonic() + args.entry_timeout
+            while not epr_avs_ready(response):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProtocolError(
+                        'EPR AVS capabilities covering the sweep did not become ready; '
+                        'check source capabilities and --type/--em settings')
+                response = exchange('pd pdo', min(args.wait, remaining))
+        if command == 'entry pd' and not _ready(response):
+            raise ProtocolError(
+                f'entry pd did not reply ready within {args.entry_timeout:g}s; '
+                'check source/CC connection and PDM settings, or increase --entry-timeout')
+
+
 def _paths(args, kind, started):
     if args.no_csv:
         return None, None
@@ -194,7 +277,7 @@ def run_sweep(args, *, version='unknown'):
     validate_sweep(args)
     points = build_plan(args)
     kind = 'pps' if args.pps_sweep else 'avs'
-    setup = ['pdm open', 'entry pd', 'pd pdo'] if args.initialize else []
+    setup = initialization_commands(args)
     measurements = args.measure_loop or int(args.measure or args.continuous_sweep)
     print(f'{kind.upper()} sweep: {len(points)} requests, PDO {args.pdo_index}, '
           f'{points[0].current_ma / 1000:g} A requested; electronic load is external')
@@ -240,37 +323,13 @@ def run_sweep(args, *, version='unknown'):
                 handle.flush()
 
         try:
+            initialize_trigger(serial, args, setup_replies)
             adc = None
             if measurements:
                 adc_args = argparse.Namespace(**vars(args))
                 adc_args.command, adc_args.transport, adc_args.port = 'adc', args.measurement_transport, None
                 adc_args.hid_path = None
                 adc = stack.enter_context(Meter(adc_args))
-            for command in setup:
-                response = bytearray()
-                entry = {'command': command}
-                setup_replies.append(entry)
-                if not args.quiet:
-                    print(command, flush=True)
-                try:
-                    serial.write(command.encode('ascii') + b'\r\n')
-                    if command == 'entry pd':
-                        # Negotiation can outlast a normal command reply. Wait passively;
-                        # resending entry pd could restart the device's negotiation.
-                        _read_reply(serial, args.entry_timeout, response,
-                                    stop_when=lambda data: _rejects(data) or _ready(data))
-                    else:
-                        _read_reply(serial, args.wait, response)
-                finally:
-                    entry['response_hex'] = response.hex(' ')
-                if not args.quiet:
-                    print(response.decode('utf-8', errors='replace').strip() or '(no reply)')
-                if _rejects(response):
-                    raise ProtocolError(f'Device rejected {command}')
-                if command == 'entry pd' and not _ready(response):
-                    raise ProtocolError(
-                        f'entry pd did not reply ready within {args.entry_timeout:g}s; '
-                        'check source/CC connection and PDM settings, or increase --entry-timeout')
 
             for index, point in enumerate(points, 1):
                 point_origin = time.monotonic()
@@ -287,7 +346,7 @@ def run_sweep(args, *, version='unknown'):
                 try:
                     if not args.quiet:
                         print(f'{index:5d}/{len(points)} [{point.leg}] {row["command"]}')
-                    serial.write(row['command'].encode('ascii') + b'\r\n')
+                    serial.write(encode_ascii_command(row['command']))
                     sent += 1
                     last_voltage = point.voltage_mv / 1000
                     row['request_status'] = 'sent_response_read_failed'
@@ -342,7 +401,7 @@ def run_sweep(args, *, version='unknown'):
                 info = dict(device='KM003C', cli_version=version, status=status, error=error,
                             started_at=started.isoformat(), elapsed_s=time.monotonic() - origin,
                             arguments={k: v for k, v in vars(args).items() if k != 'func'},
-                            source_capability_policy='explicit PDO index; pd pdo response retained, not parsed',
+                            source_capability_policy='explicit PDO index; EPR AVS range readiness checked, PDO indices/current not auto-validated',
                             current_policy='PD request only; external load not controlled',
                             negotiation_policy='sent_unverified; ASCII delivery/ADC values do not verify PD acceptance',
                             measurement_clock='host timestamps; independent ADC observations, not PD waveform timing',

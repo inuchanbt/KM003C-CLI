@@ -198,7 +198,7 @@ The manufacturer material does not define the `Time` unit or CRC8 algorithm. CRC
 
 ### Fast-charge triggers
 
-These commands send manufacturer ASCII commands through CDC and can change voltage or protocol state. `--dry-run` shows the command without sending it. `--wait` sets the response read window; `--response-file` saves exact response bytes. Successful sending alone does not establish successful negotiation. Triggers have been checked with dry runs, not live voltage changes.
+These commands send manufacturer ASCII commands through CDC and can change voltage or protocol state. Commands are sent as one CDC write without CR/LF, matching the vendor SSCOM example. No-terminator PD3.1 initialization with explicit PDM settings and PDO querying have been hardware-verified. Repeated initialization also requires correct trigger state and settings; framing alone does not guarantee readiness. `--dry-run` shows the command without sending it. `--wait` sets the response read window; `--response-file` saves exact response bytes. Successful sending alone does not establish successful negotiation. Triggers have been checked with dry runs, not live voltage changes.
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py pdm open --port COM3
@@ -249,9 +249,11 @@ python km003c_cli.py --port COM3 --pps-sweep 5:21:1:3 --pdo-index 6 --continuous
 python km003c_cli.py --mode avs --sweep 15:48:1:5 --pdo-index 11 --round-trip-sweep --dry-run
 ```
 
-By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It waits up to 10 seconds for a `ready` reply to `entry pd` and proceeds as soon as it arrives. A separate PDO query before the sweep is not required. `--entry-timeout` changes this initialization timeout; it does not lengthen each voltage request. If no `ready` arrives, check the source/CC connection and PDM settings before retrying. Use `--no-initialize` for an already prepared trigger. The command does not send `pdm set` automatically; configure `type/em/sink` separately with existing `pdm set` commands when needed.
+By default, AVS initialization sends `pdm open`, `pdm set type=2,em=2,sink=1`, `entry pd`, and `pd pdo`. PPS uses `type=1,em=1,sink=1`. If `pdm open` reports `pdm busy`, initialization closes and reopens the trigger before configuration; this restarts negotiation. It waits up to 10 seconds for a `ready` reply to `entry pd` and proceeds as soon as it arrives. A separate PDO query before the sweep is not required. For AVS targets above 20 V, the first ready may cover only SPR; the command then polls pd pdo until an AVS range covering the sweep is reported, allowing up to --entry-timeout additional seconds. It still does not infer the selected PDO index or validate request current. `--entry-timeout` changes this initialization timeout; it does not lengthen each voltage request. If no `ready` arrives, check the source/CC connection and PDM settings before retrying. Use `--no-initialize` for an already prepared trigger. Use `--type`, `--em`, and `--sink` to override PDM settings, including `--em 0` to disable e-marker simulation. With `--no-initialize`, setup commands and automatic busy recovery are skipped.
 
-**KM003C requires `--pdo-index`.** The vendor does not document a machine-readable `pd pdo` reply, so the command does not automatically select or validate a source's PDO type/voltage/current range. Inspect it with `pd --pdo` and choose a PPS/AVS PDO covering the entire range. Fixed PDOs ignore the voltage parameter and cannot sweep. Each target becomes `pd req=N,volt=mV,cur=mA`.
+CDC reads keep the COM configuration fixed instead of changing the serial timeout on every read. On Windows, changing the timeout reapplies COM state and disrupted PDM in the tested setup. The measurement interface opens after PD initialization. PDM binary PDO bytes are escaped for console display; exact bytes remain in metadata. PD3.1 initialization, AVS capabilities (15–48 V / 240 W), and concurrent HID ADC reading were verified on COM14; voltage sweeps themselves remain unverified.
+
+**KM003C requires `--pdo-index`.** The vendor does not document a machine-readable `pd pdo` reply, so the command does not automatically select the source PDO or validate its index/current limit. AVS sweeps above 20 V check that a covering AVS range has appeared before starting. Inspect it with `pd --pdo` and choose a PPS/AVS PDO covering the entire range. Fixed PDOs ignore the voltage parameter and cannot sweep. Each target becomes `pd req=N,volt=mV,cur=mA`.
 
 | Option | Behavior / default |
 | --- | --- |
@@ -266,6 +268,8 @@ By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It wait
 | `--delay` | Measurement delay; 0.5 s; continuous first read uses continuous-settle |
 | `--wait` | KM-specific ASCII reply read window except entry pd; 1 s |
 | `--entry-timeout` | Maximum wait for entry pd ready during initialization; 10 s |
+| `--pdm-startup-wait` | Minimum PDM startup read window; 2 s (also respects --wait) |
+| `--type` / `--em` / `--sink` | Override vendor PDM protocol / e-marker simulation / Sink capabilities; AVS defaults 2/2/1, PPS 1/1/1 |
 | `--measurement-transport` | HID (default) / USB ADC interface alongside CDC trigger control |
 | `--csv` / `--no-csv` | Default: unique captures/km003c_*_sweep_*.csv / disable output |
 | `--csv-overwrite` / `--csv-append` | Replace explicitly selected CSV / append after header validation; default refuses existing files |
@@ -276,7 +280,7 @@ By default, the command sends `pdm open`, `entry pd`, and `pd pdo` once. It wait
 
 Sweep CSV uses common ASD fields such as `target_voltage_v`, `request_current_a`, `actual_voltage_v`, `actual_current_a`, `sweep_leg`, and `sweep_pass`, plus KM command/response/status fields. Load targets remain blank. It is a **sweep-specific subset**, not the complete ASD CSV schema or the EZ-PD capture CSV format. Metadata is stored as `<CSV>.metadata.json`; append runs preserve previous metadata and add `<CSV>.run_<timestamp>.metadata.json`.
 
-Ctrl+C preserves partial request/reply evidence and closes the host connections. No automatic `reset` or `pdm close` is sent; subsequent source state depends on the device's state machine. Empty replies do not mean success: rows remain `sent_unverified`. Reply lines starting with error/failed/false/reject stop the sweep; other reply formats remain unverified. ADC readings describe held targets; use `capture` for PD transition waveform timing. **Live voltage sweeps and concurrent CDC trigger + HID/USB ADC access are not hardware-verified.**
+Ctrl+C preserves partial request/reply evidence and closes the host connections. No automatic `reset` or `pdm close` is sent; subsequent source state depends on the device's state machine. Empty replies do not mean success: rows remain `sent_unverified`. Reply lines starting with error/failed/false/reject stop the sweep; other reply formats remain unverified. ADC readings describe held targets; use `capture` for PD transition waveform timing. **Live voltage sweeps and USB ADC access alongside CDC are not hardware-verified; CDC initialization/PDO queries alongside HID ADC have been verified.**
 
 ## Development and verification
 

@@ -206,14 +206,22 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(fake.writes, [b'\x02\x02', b'\x03'])
         self.assertTrue(fake.closed)
 
-    def test_ascii_sends_one_line_and_closes(self):
+    def test_ascii_sends_no_terminator_and_closes(self):
         fake = FakeTransport([b'ready\r\n'])
         args = argparse.Namespace(wait=0.005)
         self.assertEqual(transport.ascii_command(args, 'entry pd', fake), b'ready\r\n')
-        self.assertEqual(fake.writes, [b'entry pd\r\n'])
+        self.assertEqual(fake.writes, [b'entry pd'])
         self.assertTrue(fake.closed)
         with self.assertRaises(ValueError):
             transport.ascii_command(args, 'entry pd\r\nreset', fake)
+
+
+    def test_ascii_payloads_are_exact_and_reject_embedded_separators(self):
+        for command in ('pdm open','entry pd','pd pdo','pd req=11,volt=15000,cur=5000'):
+            self.assertEqual(transport.encode_ascii_command(command),command.encode('ascii'))
+        for command in ('entry pd\r','entry pd\n','entry pd\0','entry pd\r\nreset'):
+            with self.assertRaises(ValueError):
+                transport.encode_ascii_command(command)
 
 
 class CliTests(unittest.TestCase):

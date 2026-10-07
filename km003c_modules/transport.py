@@ -156,7 +156,7 @@ class SerialTransport:
             if len(ports) != 1:
                 raise RuntimeError(f'Found {len(ports)} matching serial ports; select with --port.')
             port = ports[0]['port']
-        self.handle = serial.Serial(port, self.args.baud, timeout=0.05,
+        self.handle = serial.Serial(port, self.args.baud, timeout=0,
                                     write_timeout=self.args.timeout)
         return self
 
@@ -166,9 +166,18 @@ class SerialTransport:
             raise OSError(f'Short serial write: {count}/{len(data)}')
 
     def read(self, timeout: float) -> bytes:
-        self.handle.timeout = max(0, min(timeout, 0.05))
-        available = self.handle.in_waiting
-        return self.handle.read(min(65536, available) if available else 1)
+        # Changing pyserial.timeout reconfigures the whole Windows COM port,
+        # including SetCommState. Repeating that while PDM runs disrupts it.
+        # Keep the port nonblocking and enforce the read window on the host.
+        deadline = time.monotonic() + max(0, min(timeout, 0.05))
+        while True:
+            available = self.handle.in_waiting
+            if available:
+                return self.handle.read(min(65536, available))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return b''
+            time.sleep(min(0.005, remaining))
 
     def close(self):
         if self.handle is not None:
@@ -329,14 +338,27 @@ class CdcStream:
                 self.buffer.extend(data)
 
 
-def ascii_command(args, command: str, transport=None) -> bytes:
-    """Send exactly one documented ASCII command and retain its textual response."""
+def encode_ascii_command(command: str) -> bytes:
+    """One command per CDC write, without CR/LF (vendor's SSCOM framing)."""
     if any(c in command for c in ('\r', '\n', '\0')):
         raise ValueError('A command must contain only one line')
+    return command.encode('ascii')
+
+
+def format_ascii_response(response: bytes) -> str:
+    """PDM replies mix ASCII lines with binary PDOs; escape binary for consoles."""
+    text = response.decode('ascii', errors='backslashreplace')
+    return ''.join(c if c.isprintable() or c in '\r\n\t' else f'\\x{ord(c):02x}'
+                   for c in text).strip()
+
+
+def ascii_command(args, command: str, transport=None) -> bytes:
+    """Send exactly one documented ASCII command and retain its response bytes."""
+    payload = encode_ascii_command(command)
     transport = transport if transport is not None else SerialTransport(args)
     transport.open()
     try:
-        transport.write(command.encode('ascii') + b'\r\n')
+        transport.write(payload)
         deadline = time.monotonic() + args.wait
         response = bytearray()
         while time.monotonic() < deadline:

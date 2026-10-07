@@ -198,7 +198,7 @@ Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 
 
 ### 急速充電トリガー
 
-CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプロトコル状態を変更する操作です。`--dry-run` は実際に送らず内容を表示します。`--wait` は応答を読む秒数、`--response-file` は応答バイトの保存先です。送信成功だけでネゴシエーション成功とは判断できません。トリガー操作は dry-run で検証し、実機の電圧変更は行っていません。
+CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプロトコル状態を変更する操作です。 メーカーの SSCOM 例に合わせ、CR/LF を付けずに1コマンドずつ送ります。改行なしで PDM 設定を明示した PD3.1 初期化と PDO 取得は実機確認済みです。再初期化時の機器状態・設定も影響するため、改行の修正だけで準備完了を保証するわけではありません。`--dry-run` は実際に送らず内容を表示します。`--wait` は応答を読む秒数、`--response-file` は応答バイトの保存先です。送信成功だけでネゴシエーション成功とは判断できません。トリガー操作は dry-run で検証し、実機の電圧変更は行っていません。
 
 ```powershell
 .\.venv\Scripts\python.exe km003c_cli.py pdm open --port COM3
@@ -249,9 +249,11 @@ python km003c_cli.py --port COM3 --pps-sweep 5:21:1:3 --pdo-index 6 --continuous
 python km003c_cli.py --mode avs --sweep 15:48:1:5 --pdo-index 11 --round-trip-sweep --dry-run
 ```
 
-通常は開始時に `pdm open` → `entry pd` → `pd pdo` を一度送ります。`entry pd` の `ready` 応答を最大10秒待ち、受信後すぐに先へ進みます。掃引前に PDO を別途取得する必要はありません。`--entry-timeout` で初期化待ち時間を変更でき、各電圧要求の待ち時間には影響しません。`ready` が返らない場合は電源・CC 接続と PDM 設定を確認してください。すでに準備済みなら `--no-initialize`。`pdm set` は自動送信しないので、必要な `type/em/sink` 設定は既存の `pdm set` で行ってください。
+AVS の初期化は `pdm open` → `pdm set type=2,em=2,sink=1` → `entry pd` → `pd pdo` の順です。PPS は `type=1,em=1,sink=1` を使います。`pdm open` が `pdm busy` を返した場合は、トリガーを終了・再起動してから設定します。この操作はネゴシエーションをやり直します。`entry pd` の `ready` 応答を最大10秒待ち、受信後すぐに先へ進みます。掃引前に PDO を別途取得する必要はありません。 20 V 超の AVS 掃引では、最初の ready が SPR の準備完了だけを示す場合があります。掃引範囲をカバーする AVS 能力が pd pdo に現れるまで、さらに最大 --entry-timeout 秒待ちます。PDO 番号の自動選択や要求電流の検証は行いません。`--entry-timeout` で初期化待ち時間を変更でき、各電圧要求の待ち時間には影響しません。`ready` が返らない場合は電源・CC 接続と PDM 設定を確認してください。すでに準備済みなら `--no-initialize`。`--type`、`--em`、`--sink` で設定を変更でき、`--em 0` で e-marker 模擬を無効にできます。`--no-initialize` では設定送信と busy 時の復帰処理も省略します。
 
-KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo` の機械処理用の応答形式がないため、PDO 種別・対応電圧・電流の自動選択は行いません。既存の `pd --pdo` で接続先を確認し、範囲全体をカバーする PPS/AVS PDO を選んでください。Fixed PDO ではメーカー仕様上 `volt` が無視されるため、掃引には使えません。実際の要求は `pd req=N,volt=mV,cur=mA` に変換します。
+CDC の読み取り中は COM 設定を固定します。以前の処理は読み取りごとにタイムアウトを設定し、Windows が COM 状態を再適用することで、確認した構成では PDM 動作を妨げていました。測定用インターフェースは PD 初期化後に開きます。応答中のバイナリ PDO は画面ではエスケープ表示し、生バイトはメタデータに保持します。COM14 で PD3.1 初期化・AVS 15～48 V／240 W の能力取得・HID ADC 読み取りの併用を確認しました。電圧掃引そのものは未検証です。
+
+KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo` の機械処理用の応答形式がないため、PDO の自動選択や指定番号・要求電流の検証は行いません。20 V 超の AVS 掃引は、範囲をカバーする AVS 能力の取得を待ってから開始します。既存の `pd --pdo` で接続先を確認し、範囲全体をカバーする PPS/AVS PDO を選んでください。Fixed PDO ではメーカー仕様上 `volt` が無視されるため、掃引には使えません。実際の要求は `pd req=N,volt=mV,cur=mA` に変換します。
 
 | オプション | 動作・既定値 |
 | --- | --- |
@@ -266,6 +268,8 @@ KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo`
 | `--delay` | 測定前の待ち。既定 0.5 秒。continuous の初回は continuous-settle を使う |
 | `--wait` | entry pd 以外の KM 固有 ASCII 応答読み取り時間。既定 1 秒 |
 | `--entry-timeout` | 初期化時の entry pd ready 待ち上限。既定 10 秒 |
+| `--pdm-startup-wait` | PDM 起動時の読み取り時間の下限。既定 2 秒。--wait も考慮 |
+| `--type` / `--em` / `--sink` | PDM のプロトコル・e-marker 模擬・Sink 能力を変更。AVS の既定は 2/2/1、PPS は 1/1/1 |
 | `--measurement-transport` | ADC 読み取り用の HID（既定）/ USB。トリガーの CDC 接続と併用 |
 | `--csv` / `--no-csv` | 省略時は日時入りの captures/km003c_*_sweep_*.csv を作成 / 保存なし |
 | `--csv-overwrite` / `--csv-append` | 指定 CSV の上書き / 同じ列構成への追記。既定は既存ファイルを拒否 |
@@ -276,7 +280,7 @@ KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo`
 
 CSV は ASD と共通の `target_voltage_v`、`request_current_a`、`actual_voltage_v`、`actual_current_a`、`sweep_leg`、`sweep_pass` などに、KM の要求文・応答生バイト・状態を追加した**掃引用の列構成**です。電子負荷の目標値は空欄で、ASD の全 CSV 列との完全一致ではありません。`capture` の EZ-PD 用 CSV とは別形式です。メタデータは `<CSV>.metadata.json`、追記時は既存情報を残すため `<CSV>.run_<日時>.metadata.json` に保存します。
 
-Ctrl+C は途中の要求・応答・CSV を残して COM/ADC 接続を閉じます。自動の `reset` や `pdm close` は送らないため、終了後の電源状態は機器の状態機械に従います。空の応答は成功扱いにせず、CSV は `sent_unverified` と記録します。行頭の error / failed / false / reject 応答では停止し、その他の応答形式は未確認として保持します。ADC は保持中の測定値で、PD 遷移波形の時間解析には `capture` を使ってください。**掃引の電圧変更と、CDC トリガー＋HID/USB ADC の同時利用は実機未検証です。**
+Ctrl+C は途中の要求・応答・CSV を残して COM/ADC 接続を閉じます。自動の `reset` や `pdm close` は送らないため、終了後の電源状態は機器の状態機械に従います。空の応答は成功扱いにせず、CSV は `sent_unverified` と記録します。行頭の error / failed / false / reject 応答では停止し、その他の応答形式は未確認として保持します。ADC は保持中の測定値で、PD 遷移波形の時間解析には `capture` を使ってください。**掃引の電圧変更と CDC＋USB ADC の併用は実機未検証です。CDC の初期化・PDO 取得と HID ADC の併用は確認済みです。**
 
 ## 構成と検証
 

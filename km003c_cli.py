@@ -21,7 +21,7 @@ from km003c_modules.protocol import (
     ClockUnwrapper, ProtocolError, decode_adc, decode_pd, decode_cdc_adc,
     logical_packets, measurement_dict,
 )
-from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices
+from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices, format_ascii_response
 from km003c_modules.utility_export import UtilityExport, packet_for_event, packet_for_vbus_event
 from km003c_modules.vbus_events import VbusEventDetector
 from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUFFIXES,
@@ -29,7 +29,7 @@ from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUF
 
 from km003c_modules.sweep import add_sweep_options, validate_sweep, run_sweep as execute_sweep
 
-VERSION = '0.5.1'
+VERSION = '0.5.2'
 
 
 def positive_float(text):
@@ -392,7 +392,7 @@ def run_ascii(args):
         with ExitStack() as stack:
             open_output(stack, args.response_file, binary=True).write(raw)
     if raw:
-        print(raw.decode('utf-8', errors='replace'), end='' if raw.endswith(b'\n') else '\n')
+        print(format_ascii_response(raw))
     else:
         print('(no reply; command delivery does not confirm negotiation success)')
     return 0

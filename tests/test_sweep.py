@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import km003c_cli as cli
-from km003c_modules import sweep
+from km003c_modules import sweep, transport
 from test_km003c import adc_payload, frame
 from km003c_modules.protocol import ADC, ProtocolError
 
@@ -35,6 +35,7 @@ class Serial:
         self.replies = replies or {}
         self.fail_write = fail_write
         self.writes = []
+        self.raw_writes = []
         self.opens = self.closes = 0
         self.pending = []
     def open(self):
@@ -46,6 +47,7 @@ class Serial:
         if self.fail_write == command:
             raise OSError('write failed')
         self.writes.append(command)
+        self.raw_writes.append(data)
         reply = self.replies.get(command, b'ready\r\n' if command == 'entry pd' else b'OK\r\n')
         self.pending = list(reply) if isinstance(reply, list) else [reply]
     def read(self, seconds):
@@ -163,15 +165,29 @@ class SweepTests(unittest.TestCase):
             result,clock,serial,meter=self.execute(self.args('--csv',str(path),'--round-trip-sweep'))
             self.assertEqual(result,0)
             self.assertEqual((serial.opens,serial.closes),(1,1))
-            self.assertEqual(serial.writes[:3],['pdm open','entry pd','pd pdo'])
-            self.assertEqual(len(serial.writes),8)
+            self.assertEqual(serial.writes[:4],['pdm open','pdm set type=2,em=2,sink=1','entry pd','pd pdo'])
+            self.assertEqual(len(serial.writes),9)
+            self.assertEqual(serial.raw_writes,[c.encode('ascii') for c in serial.writes])
             rows=self.rows(path)
             self.assertEqual([r['target_voltage_v'] for r in rows],['15.0','16.0','17.0','16.0','15.0'])
             self.assertTrue(all(r['actual_voltage_v']==r['target_load_current_a']=='' for r in rows))
             self.assertTrue(all(r['request_status']=='sent_unverified' for r in rows))
             info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
             self.assertEqual((info['planned_points'],info['sent_requests'],info['completed_points']),(5,5,5))
-            self.assertEqual(len(info['setup']),3)
+            self.assertEqual(len(info['setup']),4)
+
+    def test_firmware_exact_entry_match_without_crlf(self):
+        clock=Clock()
+        class ExactSerial(Serial):
+            def write(self,data):
+                super().write(data)
+                if data.startswith(b'entry pd') and data != b'entry pd':
+                    self.pending=[]
+        serial=ExactSerial(clock)
+        result,*_=self.execute(self.args('--no-csv'),clock=clock,serial=serial)
+        self.assertEqual(result,0)
+        self.assertEqual(serial.raw_writes[:4],[b'pdm open',b'pdm set type=2,em=2,sink=1',b'entry pd',b'pd pdo'])
+        self.assertEqual(serial.raw_writes[-1],b'pd req=11,volt=17000,cur=5000')
 
     def test_continuous_measurement_values_and_adc_interface(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -239,7 +255,7 @@ class SweepTests(unittest.TestCase):
             serial=Serial(clock,{'entry pd':b'not ready\r\n'})
             with self.assertRaises(ProtocolError):
                 self.execute(self.args('--csv',str(path)),clock=clock,serial=serial)
-            self.assertEqual(serial.writes,['pdm open','entry pd'])
+            self.assertEqual(serial.writes,['pdm open','pdm set type=2,em=2,sink=1','entry pd'])
             self.assertEqual(serial.closes,1)
             self.assertEqual(self.rows(path),[])
             info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
@@ -252,10 +268,10 @@ class SweepTests(unittest.TestCase):
         serial=Serial(clock,{'entry pd':[b'']*24+[b'rea',b'dy\r\n']})
         result,*_=self.execute(self.args('--no-csv'),clock=clock,serial=serial)
         self.assertEqual(result,0)
-        self.assertEqual(serial.writes[:3],['pdm open','entry pd','pd pdo'])
+        self.assertEqual(serial.writes[:4],['pdm open','pdm set type=2,em=2,sink=1','entry pd','pd pdo'])
         self.assertEqual(serial.writes.count('entry pd'),1)
         # Ready ends initialization early; per-target reply windows remain .1 s.
-        self.assertAlmostEqual(clock.now,.1+1.3+.1+3*.1)
+        self.assertAlmostEqual(clock.now,2+.1+1.3+.1+3*.1)
         self.assertEqual(serial.closes,1)
 
     def test_empty_entry_reply_times_out_before_pdo_or_voltage_requests(self):
@@ -265,8 +281,8 @@ class SweepTests(unittest.TestCase):
             with self.assertRaisesRegex(ProtocolError,'within 2s.*--entry-timeout'):
                 self.execute(self.args('--csv',str(path),'--entry-timeout','2'),
                              clock=clock,serial=serial)
-            self.assertAlmostEqual(clock.now,2.1)
-            self.assertEqual(serial.writes,['pdm open','entry pd'])
+            self.assertAlmostEqual(clock.now,4.1)
+            self.assertEqual(serial.writes,['pdm open','pdm set type=2,em=2,sink=1','entry pd'])
             self.assertEqual(serial.closes,1)
             self.assertEqual(self.rows(path),[])
             info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
@@ -277,8 +293,8 @@ class SweepTests(unittest.TestCase):
         clock=Clock(); serial=Serial(clock,{'entry pd':b'error: no source\r\n'})
         with self.assertRaisesRegex(ProtocolError,'Device rejected entry pd'):
             self.execute(self.args('--no-csv'),clock=clock,serial=serial)
-        self.assertAlmostEqual(clock.now,.15)
-        self.assertEqual(serial.writes,['pdm open','entry pd'])
+        self.assertAlmostEqual(clock.now,2.15)
+        self.assertEqual(serial.writes,['pdm open','pdm set type=2,em=2,sink=1','entry pd'])
         self.assertEqual(serial.closes,1)
 
     def test_entry_interrupt_preserves_partial_reply_without_requests(self):
@@ -287,12 +303,116 @@ class SweepTests(unittest.TestCase):
             serial=Serial(clock,{'entry pd':[b'rea',KeyboardInterrupt()]})
             result,*_=self.execute(self.args('--csv',str(path)),clock=clock,serial=serial)
             self.assertEqual(result,130)
-            self.assertEqual(serial.writes,['pdm open','entry pd'])
+            self.assertEqual(serial.writes,['pdm open','pdm set type=2,em=2,sink=1','entry pd'])
             self.assertEqual(serial.closes,1)
             info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
             self.assertEqual(info['status'],'interrupted')
             self.assertEqual(info['sent_requests'],0)
             self.assertEqual(bytes.fromhex(info['setup'][-1]['response_hex']),b'rea')
+
+    def test_epr_sweep_waits_for_extended_avs_range_after_spr_ready(self):
+        clock=Clock()
+        class EprSerial(Serial):
+            def write(self,data):
+                super().write(data)
+                if data==b'pd pdo':
+                    self.pending=[b'max power 92W\nAVS: 9-20V3.00A,4.60A\n' if self.writes.count('pd pdo')==1
+                                  else b'max power 240W\nAVS: 15.00-48.00V 240W\n']
+        serial=EprSerial(clock)
+        result,*_=self.execute(self.args('--sweep','15:48:1:5','--no-csv'),clock=clock,serial=serial)
+        self.assertEqual(result,0)
+        self.assertEqual(serial.writes.count('pd pdo'),2)
+        self.assertEqual(serial.writes[4],'pd pdo')
+        self.assertTrue(serial.writes[5].startswith('pd req='))
+
+    def test_epr_capabilities_timeout_does_not_send_voltage_requests(self):
+        clock=Clock();serial=Serial(clock,{'pd pdo':b'max power 92W\nAVS: 9-20V3.00A,4.60A\n'})
+        with self.assertRaisesRegex(ProtocolError,'EPR AVS capabilities'):
+            self.execute(self.args('--sweep','15:48:1:5','--no-csv','--entry-timeout','.2'),clock=clock,serial=serial)
+        self.assertFalse(any(c.startswith('pd req=') for c in serial.writes))
+        self.assertEqual(serial.closes,1)
+
+    def test_serial_poll_preserves_com_configuration_and_deadline(self):
+        clock=Clock()
+        class Handle:
+            remaining=65537
+            @property
+            def timeout(self):
+                return 0
+            @timeout.setter
+            def timeout(self,value):
+                raise AssertionError('COM port reconfigured during read')
+            @property
+            def in_waiting(self):
+                return self.remaining if clock.now>=.01 else 0
+            def read(self,count):
+                self.remaining-=count
+                return b'x'*count
+        serial=transport.SerialTransport(self.args());serial.handle=Handle()
+        with patch.object(transport.time,'monotonic',clock.monotonic),patch.object(transport.time,'sleep',clock.sleep):
+            self.assertEqual(serial.read(0),b'')
+            self.assertEqual(len(serial.read(.02)),65536)
+            self.assertAlmostEqual(clock.now,.01)
+            self.assertEqual(serial.read(0),b'x')
+            self.assertEqual(serial.read(.02),b'')
+            self.assertAlmostEqual(clock.now,.03)
+            self.assertEqual(serial.read(-1),b'')
+            self.assertAlmostEqual(clock.now,.03)
+
+    def test_binary_pdo_console_response_is_ascii_without_control_bytes(self):
+        raw=b'ok\npdo:5\x0b\xff\x00\x81\nready:5100mV,0mA\n'
+        text=transport.format_ascii_response(raw)
+        self.assertIn('pdo:5\\x0b\\xff\\x00\\x81',text)
+        self.assertIn('ready:5100mV,0mA',text)
+        text.encode('ascii')
+        self.assertNotIn('\x00',text)
+        self.assertNotIn('\x0b',text)
+
+    def test_measurement_interface_opens_only_after_ready_and_pdo_query(self):
+        clock=Clock();serial=Serial(clock);meter=Meter()
+        def open_meter(args):
+            self.assertEqual(serial.writes[-1],'pd pdo')
+            return meter
+        with patch.object(sweep.time,'monotonic',clock.monotonic),patch.object(sweep.time,'sleep',clock.sleep),patch.object(sweep,'SerialTransport',return_value=serial),patch.object(sweep,'Meter',side_effect=open_meter),redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.run_sweep(self.args('--continuous-sweep','--no-csv')),0)
+        self.assertEqual(meter.reads,3)
+        clock=Clock();serial=Serial(clock,{'entry pd':b'error: no source\n'})
+        with patch.object(sweep,'Meter',side_effect=AssertionError('measurement opened before readiness')):
+            with patch.object(sweep.time,'monotonic',clock.monotonic),patch.object(sweep.time,'sleep',clock.sleep),patch.object(sweep,'SerialTransport',return_value=serial),redirect_stdout(io.StringIO()),self.assertRaises(ProtocolError):
+                cli.run_sweep(self.args('--continuous-sweep','--no-csv'))
+
+    def test_pps_pdm_defaults_and_explicit_configuration(self):
+        args=cli.build_arg_parser().parse_args(['sweep','--pps-sweep','5:6:1:3','--pdo-index','6'])
+        self.assertEqual(sweep.initialization_commands(args),
+                         ['pdm open','pdm set type=1,em=1,sink=1','entry pd','pd pdo'])
+        args=self.args('--type','0','--em','0','--sink','0')
+        self.assertEqual(sweep.initialization_commands(args)[1],'pdm set type=0,em=0,sink=0')
+        self.assertEqual(args.pdm_startup_wait,2)
+
+    def test_busy_trigger_restarts_before_configuration_and_request(self):
+        clock=Clock()
+        class BusySerial(Serial):
+            def write(self,data):
+                super().write(data)
+                if data==b'pdm open':
+                    self.pending=[b'pdm busy\n' if self.writes.count('pdm open')==1 else b'pdm mode entry\nver1.0\n']
+        serial=BusySerial(clock)
+        result,*_=self.execute(self.args('--no-csv'),clock=clock,serial=serial)
+        self.assertEqual(result,0)
+        self.assertEqual(serial.writes[:6],['pdm open','pdm close','pdm open',
+                         'pdm set type=2,em=2,sink=1','entry pd','pd pdo'])
+        self.assertTrue(serial.writes[6].startswith('pd req='))
+        self.assertEqual(serial.closes,1)
+
+    def test_persistent_busy_or_rejected_config_stops_before_requests(self):
+        for replies,expected in [({'pdm open':b'pdm busy\n'},'remained busy'),
+            ({'pdm set type=2,em=2,sink=1':b'error: config\n'},'Device rejected')]:
+            clock=Clock();serial=Serial(clock,replies)
+            with self.subTest(replies=replies),self.assertRaisesRegex(ProtocolError,expected):
+                self.execute(self.args('--no-csv'),clock=clock,serial=serial)
+            self.assertNotIn('entry pd',serial.writes)
+            self.assertFalse(any(c.startswith('pd req=') for c in serial.writes))
+            self.assertEqual(serial.closes,1)
 
     def test_rejection_stops_and_preserves_reply(self):
         with tempfile.TemporaryDirectory() as folder:
