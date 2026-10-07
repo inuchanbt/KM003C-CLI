@@ -14,6 +14,7 @@ cd KM003C-CLI
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe km003c_cli.py --help
+
 .\.venv\Scripts\python.exe km003c_cli.py usb-info
 ```
 
@@ -198,13 +199,16 @@ The manufacturer material does not define the `Time` unit or CRC8 algorithm. CRC
 
 ### Fast-charge triggers
 
-These commands send manufacturer ASCII commands through CDC and can change voltage or protocol state. Commands are sent as one CDC write without CR/LF, matching the vendor SSCOM example. No-terminator PD3.1 initialization with explicit PDM settings and PDO querying have been hardware-verified. Repeated initialization also requires correct trigger state and settings; framing alone does not guarantee readiness. `--dry-run` shows the command without sending it. `--wait` sets the response read window; `--response-file` saves exact response bytes. Successful sending alone does not establish successful negotiation. Triggers have been checked with dry runs, not live voltage changes.
+These commands send manufacturer ASCII commands through CDC and can change voltage or protocol state. Commands are sent as one CDC write without CR/LF, matching the vendor SSCOM example. No-terminator PD3.1 initialization with explicit PDM settings and PDO querying have been hardware-verified. Repeated initialization also requires correct trigger state and settings; framing alone does not guarantee readiness. `--dry-run` shows the command without sending it. `--wait` sets the response read window; `--response-file` saves exact response bytes. Successful sending alone does not establish successful negotiation.
+
+**To acquire source PDOs, use `pdo --port COM14`.** This opens the COM port once and shares the sweep initialization: `pdm open` → PDM configuration → `entry pd` → `pd pdo`, including busy recovery, startup timing, and the ready wait. Running these commands as separate CLI processes reopens the COM port each time; the reported setup received no replies after the first command. The new command holds one connection through acquisition and cleanup. Defaults are PD3.1 / EPR e-marker / 5 A Sink capabilities (`type=2,em=2,sink=1`); keep the external electronic load off or at low current during acquisition.
+
+By default, it additionally polls for PDOs above 20 V for up to `--entry-timeout` seconds after the initial query. An EPR AVS range or a fixed PDO above 20 V ends that wait. If only SPR PDOs are received, it warns and displays the last valid response; if no valid PDO response arrives, it fails. `--no-epr` shows the first valid response without the additional EPR wait. For PD3.0/PPS settings, use `pdo --type 1 --em 1`; EPR polling is also skipped with a non-EPR e-marker setting. `--wait`, `--entry-timeout`, and `--pdm-startup-wait` have the same defaults as sweep. It sends no sweep voltage requests and opens no ADC connection. Success, Ctrl+C, and errors use `reset` → `pdm close` before closing the same COM connection; `--keep-trigger` explicitly skips release. Without ADC, cleanup acknowledgment does not verify voltage recovery.
+
+`--quiet` still displays the final PDO response. `--response-file captures/source_pdo.txt` saves its exact bytes; `--force` permits replacement. `--dry-run` only prints the sequence. The vendor PDO text is preserved without assigning indices: displayed rows can omit reserved PDO positions. The existing `pd --pdo` sends one query without initialization; use `pdo` for the complete acquisition procedure.
 
 ```powershell
-.\.venv\Scripts\python.exe km003c_cli.py pdm open --port COM3
-.\.venv\Scripts\python.exe km003c_cli.py pdm set --type 2 --em 2 --sink 1 --port COM3
-.\.venv\Scripts\python.exe km003c_cli.py entry pd --port COM3
-.\.venv\Scripts\python.exe km003c_cli.py pd --pdo --port COM3
+.\.venv\Scripts\python.exe km003c_cli.py pdo --port COM14
 .\.venv\Scripts\python.exe km003c_cli.py pd --req 2 --cur 3000 --port COM3
 .\.venv\Scripts\python.exe km003c_cli.py pd --req 5 --volt 12000 --cur 3000 --port COM3
 .\.venv\Scripts\python.exe km003c_cli.py pd --cmd 18 --port COM3
@@ -221,6 +225,7 @@ These commands send manufacturer ASCII commands through CDC and can change volta
 
 | Command | Options / values |
 | --- | --- |
+| `pdo` | Initialize and acquire source PDOs in one COM session; `--no-epr`, `--type`, `--em`, `--sink`, timing options, `--response-file`, `--force`, `--keep-trigger` |
 | `pdm` | `open` / `close` / `set`; `set`: `--type` 0–3, `--em` 0–2, `--sink` 0/1 |
 | `entry` | `pd`, `ufcs`, `qc`, `fcp`, `scp`, `afc`, `vfcp`, `sfcp`, `bc`, `apple`, `list`, `list+` |
 | `pd` | One of `--pdo`, `--req`, `--cmd`, `--data`, `--drp`; request parameters `--volt`, `--cur` |

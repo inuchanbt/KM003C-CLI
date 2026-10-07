@@ -43,6 +43,28 @@ class SweepPoint:
         return f'pd req={pdo_index},volt={self.voltage_mv},cur={self.current_ma}'
 
 
+def add_trigger_options(parser, positive_float, nonnegative_float, *, allow_no_initialize=True):
+    parser.add_argument('--wait', type=positive_float, default=1.0,
+                        help='per-command ASCII reply read window in seconds (excludes entry pd)')
+    parser.add_argument('--entry-timeout', type=positive_float, default=10.0,
+                        help='maximum seconds for entry pd ready and additional PDO readiness wait (default: 10)')
+    parser.add_argument('--pdm-startup-wait', type=nonnegative_float, default=2.0,
+                        help='minimum PDM startup reply window in seconds (default: 2)')
+    parser.add_argument('--type', type=int, choices=[0,1,2,3],
+                        help='PDM protocol: default PD3.1 (PD3.0 for PPS sweeps)')
+    parser.add_argument('--em', type=int, choices=[0,1,2],
+                        help='e-marker simulation: 0 off, 1 20V5A, 2 EPR; default 2 (1 for PPS sweeps)')
+    parser.add_argument('--sink', type=int, choices=[0,1], default=1,
+                        help='Sink capabilities: 0 3A PPS, 1 5A PPS (default)')
+    if allow_no_initialize:
+        parser.add_argument('--initialize', action=argparse.BooleanOptionalAction, default=True,
+                            help='open/configure PDM, enter PD and query PDOs; restart PDM if already busy')
+    else:
+        parser.set_defaults(initialize=True)
+    parser.add_argument('--keep-trigger', action=argparse.BooleanOptionalAction, default=False,
+                        help='keep the last PD request on exit; default resets and closes PDM')
+
+
 def add_sweep_options(parser, connection_options, positive_float, nonnegative_float,
                       positive_int, nonnegative_int):
     connection_options(parser, cdc_only=True)
@@ -65,22 +87,7 @@ def add_sweep_options(parser, connection_options, positive_float, nonnegative_fl
     parser.add_argument('--measure-loop', type=nonnegative_int, default=0)
     parser.add_argument('--delay', type=nonnegative_float, default=0.5)
     parser.add_argument('--measurement-transport', choices=['hid', 'usb'], default='hid')
-    parser.add_argument('--wait', type=positive_float, default=1.0,
-                        help='ASCII reply read window in seconds (included in hold; excludes entry pd)')
-    parser.add_argument('--entry-timeout', type=positive_float, default=10.0,
-                        help='maximum seconds to wait for entry pd ready (default: 10)')
-    parser.add_argument('--pdm-startup-wait', type=nonnegative_float, default=2.0,
-                        help='minimum PDM startup reply window in seconds (default: 2)')
-    parser.add_argument('--type', type=int, choices=[0,1,2,3],
-                        help='PDM protocol: default PD3.1 for AVS, PD3.0 for PPS')
-    parser.add_argument('--em', type=int, choices=[0,1,2],
-                        help='e-marker simulation: 0 off, 1 20V5A, 2 EPR; default 2 AVS / 1 PPS')
-    parser.add_argument('--sink', type=int, choices=[0,1], default=1,
-                        help='Sink capabilities: 0 3A PPS, 1 5A PPS (default)')
-    parser.add_argument('--initialize', action=argparse.BooleanOptionalAction, default=True,
-                        help='open/configure PDM, enter PD and query PDOs; restart PDM if already busy')
-    parser.add_argument('--keep-trigger', action=argparse.BooleanOptionalAction, default=False,
-                        help='keep the last PD request on exit; default resets and closes PDM')
+    add_trigger_options(parser, positive_float, nonnegative_float)
     parser.add_argument('--pause-before-sweep', action='store_true',
                         help='wait for Enter after initialization, before the first voltage request; configure external load manually')
     parser.add_argument('--dry-run', action='store_true', help='print plan; no hardware or files')
@@ -193,7 +200,20 @@ def initialization_commands(args):
             'entry pd', 'pd pdo']
 
 
-def initialize_trigger(serial, args, setup_replies):
+def has_pdo_response(response):
+    # Keep the vendor text intact: displayed rows omit reserved object positions.
+    return bool(re.search(rb'^\s*(?:Fixed|PPS|AVS):\s*\d', response, re.I | re.M))
+
+
+def has_epr_pdo(response):
+    ranges = re.findall(rb'^\s*AVS:\s*\d+(?:\.\d+)?-(\d+(?:\.\d+)?)V',
+                        response, re.I | re.M)
+    fixed = re.findall(rb'^\s*Fixed:\s*(\d+(?:\.\d+)?)V', response, re.I | re.M)
+    return any(Decimal(value.decode('ascii')) > 20 for value in ranges + fixed)
+
+
+def initialize_trigger(serial, args, setup_replies, *, required_avs_range=None, require_pdo=False,
+                       wait_for_epr=False):
     """Configure the trigger explicitly and retain each setup exchange."""
     def exchange(command, seconds=None):
         response = bytearray()
@@ -221,16 +241,14 @@ def initialize_trigger(serial, args, setup_replies):
     def busy(response):
         return bool(re.search(rb'^\s*pdm busy\s*$', response, re.I | re.M))
 
-    points = build_plan(args)
-    voltage_min = min(p.voltage_mv for p in points)
-    voltage_max = max(p.voltage_mv for p in points)
-    needs_epr_avs = not args.pps_sweep and voltage_max > 20000
+    pdo_response = None
 
     def epr_avs_ready(response):
         # The first ready can precede EPR entry. The textual pd pdo reply
         # exposes ranges while omitting reserved PDO slots; do not infer indices.
         ranges = re.findall(rb'^AVS:\s*(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)V',
                             response, re.M | re.I)
+        voltage_min, voltage_max = required_avs_range
         return any(Decimal(low.decode('ascii')) * 1000 <= voltage_min and
                    Decimal(high.decode('ascii')) * 1000 >= voltage_max
                    for low, high in ranges)
@@ -244,7 +262,7 @@ def initialize_trigger(serial, args, setup_replies):
             response = exchange('pdm open')
             if busy(response):
                 raise ProtocolError('PDM remained busy after close/open; check the device trigger state')
-        if command == 'pd pdo' and needs_epr_avs:
+        if command == 'pd pdo' and required_avs_range is not None:
             deadline = time.monotonic() + args.entry_timeout
             while not epr_avs_ready(response):
                 remaining = deadline - time.monotonic()
@@ -253,10 +271,28 @@ def initialize_trigger(serial, args, setup_replies):
                         'EPR AVS capabilities covering the sweep did not become ready; '
                         'check source capabilities and --type/--em settings')
                 response = exchange('pd pdo', min(args.wait, remaining))
+        if command == 'pd pdo' and require_pdo:
+            deadline = time.monotonic() + args.entry_timeout
+            while True:
+                if has_pdo_response(response):
+                    pdo_response = bytes(response)
+                if pdo_response is not None and (not wait_for_epr or has_epr_pdo(pdo_response)):
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if pdo_response is None:
+                        raise ProtocolError('No PDO capabilities received within the PDO wait window; '
+                                            'check source/CC connection and PDM settings')
+                    print('EPR PDOs were not observed within the wait window; '
+                          'showing the last valid PDO response', file=sys.stderr)
+                    break
+                response = exchange('pd pdo', min(args.wait, remaining))
         if command == 'entry pd' and not _ready(response):
             raise ProtocolError(
                 f'entry pd did not reply ready within {args.entry_timeout:g}s; '
                 'check source/CC connection and PDM settings, or increase --entry-timeout')
+
+    return pdo_response
 
 
 CLEANUP_REPLY_SECONDS = 2.0
@@ -413,7 +449,9 @@ def run_sweep(args, *, version='unknown'):
 
         adc = None
         try:
-            initialize_trigger(serial, args, setup_replies)
+            required_range = ((min(p.voltage_mv for p in points), max(p.voltage_mv for p in points))
+                              if kind == 'avs' and max(p.voltage_mv for p in points) > 20000 else None)
+            initialize_trigger(serial, args, setup_replies, required_avs_range=required_range)
             if measurements:
                 adc_args = argparse.Namespace(**vars(args))
                 adc_args.command, adc_args.transport, adc_args.port = 'adc', args.measurement_transport, None

@@ -29,7 +29,9 @@ from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUF
 
 from km003c_modules.sweep import add_sweep_options, validate_sweep, run_sweep as execute_sweep
 
-VERSION = '0.5.4'
+from km003c_modules.pdo import add_pdo_options, run_pdo
+
+VERSION = '0.5.5'
 
 
 def positive_float(text):
@@ -209,6 +211,10 @@ def build_arg_parser():
     p = sub.add_parser('sweep', aliases=['load'], help='ASD-style PPS/AVS voltage sweep')
     add_sweep_options(p, connection_options, positive_float, nonnegative_float, positive_int, nonnegative_int)
     p.set_defaults(func=run_sweep)
+
+    p = sub.add_parser('pdo', help='initialize PD and query source PDOs in one CDC session')
+    add_pdo_options(p, connection_options, positive_float, nonnegative_float)
+    p.set_defaults(func=run_pdo)
 
     p = sub.add_parser('pdm', help='open/close/configure the fast-charge trigger module')
     p.add_argument('action', choices=['open', 'close', 'set'])

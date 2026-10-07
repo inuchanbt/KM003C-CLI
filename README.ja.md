@@ -198,13 +198,16 @@ Live-status CSV は CY4500 と同じ 18 列です。単独の `scope` は `<CSV 
 
 ### 急速充電トリガー
 
-CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプロトコル状態を変更する操作です。 メーカーの SSCOM 例に合わせ、CR/LF を付けずに1コマンドずつ送ります。改行なしで PDM 設定を明示した PD3.1 初期化と PDO 取得は実機確認済みです。再初期化時の機器状態・設定も影響するため、改行の修正だけで準備完了を保証するわけではありません。`--dry-run` は実際に送らず内容を表示します。`--wait` は応答を読む秒数、`--response-file` は応答バイトの保存先です。送信成功だけでネゴシエーション成功とは判断できません。トリガー操作は dry-run で検証し、実機の電圧変更は行っていません。
+CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプロトコル状態を変更する操作です。 メーカーの SSCOM 例に合わせ、CR/LF を付けずに1コマンドずつ送ります。改行なしで PDM 設定を明示した PD3.1 初期化と PDO 取得は実機確認済みです。再初期化時の機器状態・設定も影響するため、改行の修正だけで準備完了を保証するわけではありません。`--dry-run` は実際に送らず内容を表示します。`--wait` は応答を読む秒数、`--response-file` は応答バイトの保存先です。送信成功だけでネゴシエーション成功とは判断できません。
+
+**電源の PDO 取得には `pdo --port COM14` を使ってください。** COM ポートを一度だけ開き、sweep と共通の `pdm open` → PDM 設定 → `entry pd` → `pd pdo` を実行します。busy 時の再起動、起動待ち、ready 待ちも共有します。これらを別々の CLI プロセスで実行すると毎回 COM を開き直し、今回の接続では最初のコマンド以降に応答が返らないことが報告されました。専用コマンドは取得から終了処理まで同じ接続を維持します。既定は PD3.1／EPR e-marker／5 A Sink 能力（`type=2,em=2,sink=1`）です。取得中は外部電子負荷を OFF または低電流にしてください。
+
+既定では初回の PDO 問い合わせ後、20 V 超の PDO が現れるまで最大 `--entry-timeout` 秒追加で問い合わせます。EPR の AVS 範囲、または 20 V 超の固定 PDO を検出すれば待機を終了します。SPR の PDO だけ取得できた場合は警告とともに最後の有効な応答を表示し、有効な PDO 応答が一度もなければエラー終了します。`--no-epr` は追加の EPR 待ちを省き、最初の有効な応答を表示します。PD3.0／PPS 設定にするなら `pdo --type 1 --em 1`。EPR 以外の e-marker 設定でも EPR 待ちは省きます。`--wait`、`--entry-timeout`、`--pdm-startup-wait` の既定値は sweep と共通です。掃引の電圧要求は送らず、ADC 接続も開きません。正常終了・Ctrl+C・エラー時は同じ COM 接続で `reset` → `pdm close` を行ってから接続を閉じます。`--keep-trigger` を明示した場合だけ後処理を省きます。ADC を使わないため、後処理の応答確認は電圧復帰の実測確認ではありません。
+
+`--quiet` でも最終 PDO 応答を表示します。`--response-file captures/source_pdo.txt` は応答の生バイトを保存し、`--force` で上書きできます。`--dry-run` は手順表示だけです。表示行は予約 PDO 番号を省略する場合があるため、自動で番号を振り直しません。既存の `pd --pdo` は初期化なしの単発問い合わせです。初期化から取得する場合は `pdo` を使ってください。
 
 ```powershell
-.\.venv\Scripts\python.exe km003c_cli.py pdm open --port COM3
-.\.venv\Scripts\python.exe km003c_cli.py pdm set --type 2 --em 2 --sink 1 --port COM3
-.\.venv\Scripts\python.exe km003c_cli.py entry pd --port COM3
-.\.venv\Scripts\python.exe km003c_cli.py pd --pdo --port COM3
+.\.venv\Scripts\python.exe km003c_cli.py pdo --port COM14
 .\.venv\Scripts\python.exe km003c_cli.py pd --req 2 --cur 3000 --port COM3
 .\.venv\Scripts\python.exe km003c_cli.py pd --req 5 --volt 12000 --cur 3000 --port COM3
 .\.venv\Scripts\python.exe km003c_cli.py pd --cmd 18 --port COM3
@@ -221,6 +224,7 @@ CDC 経由でメーカーの ASCII コマンドを送信し、出力電圧やプ
 
 | コマンド | オプション / 値 |
 | --- | --- |
+| `pdo` | 同じ COM 接続で初期化から PDO 取得まで実行。`--no-epr`、`--type`、`--em`、`--sink`、待機時間、`--response-file`、`--force`、`--keep-trigger` |
 | `pdm` | `open` / `close` / `set`。`set`：`--type` 0–3、`--em` 0–2、`--sink` 0/1 |
 | `entry` | `pd`、`ufcs`、`qc`、`fcp`、`scp`、`afc`、`vfcp`、`sfcp`、`bc`、`apple`、`list`、`list+` |
 | `pd` | `--pdo`、`--req`、`--cmd`、`--data`、`--drp` のいずれか。要求パラメータは `--volt`、`--cur` |
