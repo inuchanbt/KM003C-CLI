@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
+import signal
+import struct
 from pathlib import Path
 import tempfile
 import unittest
@@ -77,7 +79,7 @@ class SweepTests(unittest.TestCase):
     def args(self, *extra):
         return cli.build_arg_parser().parse_args([
             'sweep', '--sweep', '15:17:1:5', '--pdo-index', '11',
-            '--wait', '.1', '--quiet', *extra])
+            '--wait', '.1', '--quiet', '--keep-trigger', *extra])
 
     def execute(self, args, *, serial=None, meter=None, clock=None):
         clock = clock or Clock()
@@ -489,6 +491,132 @@ class SweepTests(unittest.TestCase):
         result,_,serial,_=self.execute(self.args('--no-csv','--no-initialize'))
         self.assertEqual(result,0)
         self.assertTrue(all(c.startswith('pd req=') for c in serial.writes))
+
+    def release_meter(self):
+        payload=bytearray(adc_payload())
+        struct.pack_into('<i',payload,0,5_100_000)
+        struct.pack_into('<i',payload,8,5_100_000)
+        struct.pack_into('<i',payload,4,0)
+        struct.pack_into('<i',payload,12,0)
+        return Meter(frame(ADC,bytes(payload)))
+
+    def test_default_policy_releases_and_dry_run_lists_cleanup(self):
+        args=cli.build_arg_parser().parse_args(['sweep','--sweep','15:17:1:5','--pdo-index','11'])
+        self.assertFalse(args.keep_trigger)
+        args.dry_run=True
+        output=io.StringIO()
+        with redirect_stdout(output),patch.object(sweep,'SerialTransport',side_effect=AssertionError('hardware')):
+            self.assertEqual(cli.run_sweep(args),0)
+        self.assertIn('Exit cleanup: reset -> pdm close',output.getvalue())
+
+    def test_completed_sweep_releases_before_close_and_records_low_voltage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';meter=self.release_meter()
+            result,clock,serial,_=self.execute(self.args('--no-keep-trigger','--continuous-sweep','--csv',str(path)),meter=meter)
+            self.assertEqual(result,0)
+            self.assertEqual(serial.raw_writes[-2:],[b'reset',b'pdm close'])
+            self.assertEqual((serial.closes,meter.closes,meter.reads),(1,1,4))
+            self.assertEqual(len(self.rows(path)),3)
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual((info['status'],info['sent_requests'],info['last_requested_voltage_V']),('completed',3,17))
+            cleanup=info['cleanup']
+            self.assertEqual(cleanup['status'],'acknowledged')
+            self.assertTrue(cleanup['voltage_verified'])
+            self.assertAlmostEqual(cleanup['actual_voltage_V'],5.1)
+            self.assertFalse(cleanup['external_load_controlled'])
+            self.assertEqual([c['command'] for c in cleanup['commands']],['reset','pdm close'])
+
+    def test_ctrl_c_during_reply_preserves_partial_data_then_releases(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';clock=Clock()
+            serial=Serial(clock,{'pd req=11,volt=16000,cur=5000':[b'part',KeyboardInterrupt()]})
+            result,*_=self.execute(self.args('--no-keep-trigger','--no-initialize','--csv',str(path)),clock=clock,serial=serial)
+            self.assertEqual(result,130)
+            self.assertEqual(serial.writes[-2:],['reset','pdm close'])
+            self.assertEqual(bytes.fromhex(self.rows(path)[-1]['raw_command_response']),b'part')
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual((info['status'],info['sent_requests'],info['completed_points']),('interrupted',2,1))
+            self.assertEqual(info['cleanup']['status'],'acknowledged')
+            self.assertFalse(info['cleanup']['voltage_verified'])
+
+    def test_interrupt_during_hold_also_releases(self):
+        class HoldClock(Clock):
+            def sleep(self,seconds):
+                raise KeyboardInterrupt()
+        clock=HoldClock();serial=Serial(clock)
+        result,*_=self.execute(self.args('--no-keep-trigger','--no-initialize','--no-csv','--apdo-voltage-hold','2'),clock=clock,serial=serial)
+        self.assertEqual(result,130)
+        self.assertEqual(serial.writes,['pd req=11,volt=15000,cur=5000','reset','pdm close'])
+        self.assertEqual(serial.closes,1)
+
+    def test_original_error_survives_cleanup_failure_and_close_is_attempted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';clock=Clock()
+            serial=Serial(clock,{'reset':[OSError('cleanup read failed')]},fail_write='pd req=11,volt=16000,cur=5000')
+            warnings=io.StringIO()
+            with redirect_stderr(warnings),self.assertRaisesRegex(OSError,'^write failed$'):
+                self.execute(self.args('--no-keep-trigger','--no-initialize','--csv',str(path)),clock=clock,serial=serial)
+            self.assertEqual(serial.writes[-2:],['reset','pdm close'])
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['error'],'write failed')
+            self.assertEqual(info['cleanup']['status'],'failed')
+            self.assertEqual(info['cleanup']['commands'][-1]['status'],'acknowledged')
+            self.assertIn('cleanup read failed',warnings.getvalue())
+            self.assertEqual(serial.closes,1)
+
+    def test_cleanup_negative_empty_and_write_failure_are_not_success(self):
+        cases=[({'reset':b'error: busy\n'},None),({'reset':b''},None),({},'reset'),({'pdm close':b'error: close\n'},None)]
+        for replies,fail_write in cases:
+            with self.subTest(replies=replies,fail_write=fail_write),tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)/'run.csv';clock=Clock();serial=Serial(clock,replies,fail_write=fail_write)
+                with redirect_stderr(io.StringIO()),self.assertRaisesRegex(ProtocolError,'Trigger cleanup failed'):
+                    self.execute(self.args('--no-keep-trigger','--no-initialize','--csv',str(path)),clock=clock,serial=serial)
+                self.assertEqual(serial.writes[-1],'pdm close')
+                info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+                self.assertEqual(info['status'],'failed')
+                self.assertEqual(info['completed_points'],3)
+                self.assertEqual(info['cleanup']['status'],'failed')
+                self.assertEqual(len(self.rows(path)),3)
+                self.assertEqual(serial.closes,1)
+
+    def test_cleanup_detects_retained_high_voltage_even_with_ok_replies(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';meter=Meter()
+            with redirect_stderr(io.StringIO()),self.assertRaisesRegex(ProtocolError,'Output remains'):
+                self.execute(self.args('--no-keep-trigger','--continuous-sweep','--csv',str(path)),meter=meter)
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['cleanup']['status'],'failed')
+            self.assertFalse(info['cleanup']['voltage_verified'])
+            self.assertAlmostEqual(info['cleanup']['actual_voltage_V'],8.9999)
+            self.assertEqual(len(self.rows(path)),3)
+            self.assertEqual(meter.closes,1)
+
+    def test_initialization_failure_also_runs_cleanup(self):
+        clock=Clock();serial=Serial(clock,{'entry pd':b'error: no source\n'})
+        with self.assertRaisesRegex(ProtocolError,'Device rejected entry pd'):
+            self.execute(self.args('--no-keep-trigger','--no-csv'),clock=clock,serial=serial)
+        self.assertEqual(serial.writes[-2:],['reset','pdm close'])
+        self.assertFalse(any(c.startswith('pd req=') for c in serial.writes))
+
+    def test_keep_trigger_skips_cleanup_and_final_adc(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'run.csv';meter=Meter()
+            _,_,serial,_=self.execute(self.args('--continuous-sweep','--csv',str(path)),meter=meter)
+            self.assertEqual(meter.reads,3)
+            self.assertNotIn('reset',serial.writes)
+            info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(info['cleanup']['status'],'skipped')
+            self.assertEqual(info['cleanup']['commands'],[])
+
+    def test_cleanup_restores_sigint_handler_after_second_interrupt(self):
+        clock=Clock();serial=Serial(clock,{'reset':[b'ok\n',KeyboardInterrupt()]})
+        handler=signal.getsignal(signal.SIGINT)
+        with patch.object(sweep.time,'monotonic',clock.monotonic),patch.object(sweep.time,'sleep',clock.sleep),redirect_stderr(io.StringIO()):
+            result=sweep.release_trigger(serial,self.args('--no-keep-trigger'))
+        self.assertEqual(signal.getsignal(signal.SIGINT),handler)
+        self.assertEqual(result['status'],'failed')
+        self.assertEqual(serial.writes,['reset','pdm close'])
+        self.assertEqual(bytes.fromhex(result['commands'][0]['response_hex']),b'ok\n')
 
     def test_output_policy_requires_explicit_csv(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

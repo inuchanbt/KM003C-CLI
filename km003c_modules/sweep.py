@@ -12,6 +12,9 @@ import csv
 import json
 from pathlib import Path
 import re
+import signal
+import sys
+import threading
 import time
 
 from .protocol import ADC, ProtocolError, decode_adc, logical_packets
@@ -76,6 +79,8 @@ def add_sweep_options(parser, connection_options, positive_float, nonnegative_fl
                         help='Sink capabilities: 0 3A PPS, 1 5A PPS (default)')
     parser.add_argument('--initialize', action=argparse.BooleanOptionalAction, default=True,
                         help='open/configure PDM, enter PD and query PDOs; restart PDM if already busy')
+    parser.add_argument('--keep-trigger', action=argparse.BooleanOptionalAction, default=False,
+                        help='keep the last PD request on exit; default resets and closes PDM')
     parser.add_argument('--dry-run', action='store_true', help='print plan; no hardware or files')
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--csv', help='default: unique sweep filename in captures/')
@@ -251,6 +256,82 @@ def initialize_trigger(serial, args, setup_replies):
                 'check source/CC connection and PDM settings, or increase --entry-timeout')
 
 
+CLEANUP_REPLY_SECONDS = 2.0
+CLEANUP_LOW_VOLTAGE_LIMIT = 5.5
+
+
+def release_trigger(serial, args, adc=None):
+    """Try both release commands, preserving failures independently of the sweep."""
+    result = dict(policy='keep_trigger' if args.keep_trigger else 'reset_then_close',
+                  status='skipped' if args.keep_trigger else 'pending', commands=[], errors=[],
+                  voltage_verified=False, external_load_controlled=False)
+    if args.keep_trigger:
+        return result
+    def display(message, *, warning=False):
+        # A closed/redirected console must not prevent releasing the trigger.
+        if args.quiet and not warning:
+            return
+        try:
+            print(message, file=sys.stderr if warning else sys.stdout, flush=True)
+        except (OSError, ValueError):
+            pass
+
+    # A second Ctrl+C must not skip the close command. Preserve failures for
+    # metadata; bound both reply windows and restore the signal handler afterward.
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN) if main_thread else None
+    try:
+        for command in ('reset', 'pdm close'):
+            response = bytearray()
+            entry = dict(command=command, sent=False, status='write_failed')
+            result['commands'].append(entry)
+            try:
+                display(f'Cleanup: {command}')
+                serial.write(encode_ascii_command(command))
+                entry.update(sent=True, status='read_failed')
+                _read_reply(serial, CLEANUP_REPLY_SECONDS, response)
+                if _rejects(response):
+                    entry['status'] = 'device_rejected'
+                    raise ProtocolError(f'Device rejected cleanup {command}')
+                if not re.search(rb'^\s*ok\s*$', response, re.I | re.M):
+                    entry['status'] = 'unacknowledged'
+                    raise ProtocolError(f'Cleanup {command} did not reply ok')
+                entry['status'] = 'acknowledged'
+            except (Exception, KeyboardInterrupt) as exc:
+                entry['error'] = 'Ctrl+C during cleanup' if isinstance(exc, KeyboardInterrupt) else str(exc)
+                result['errors'].append(entry['error'])
+            finally:
+                entry['response_hex'] = response.hex(' ')
+            if response:
+                display(format_ascii_response(response))
+        if adc is not None:
+            response = bytearray()
+            try:
+                response.extend(adc.get_data(ADC))
+                sample = next((decode_adc(p.payload) for p in logical_packets(response)
+                               if p.attribute == ADC), None)
+                if sample is None:
+                    raise ProtocolError('No ADC payload in cleanup verification')
+                result.update(actual_voltage_V=sample.voltage, actual_current_A=sample.current,
+                              actual_power_W=sample.power, low_voltage_limit_V=CLEANUP_LOW_VOLTAGE_LIMIT)
+                if abs(sample.voltage) > CLEANUP_LOW_VOLTAGE_LIMIT:
+                    raise ProtocolError(f'Output remains at {sample.voltage:g} V after cleanup')
+                result['voltage_verified'] = True
+                display(f'After cleanup: {sample.voltage:.4f} V  {sample.current:.4f} A')
+            except (Exception, KeyboardInterrupt) as exc:
+                result['errors'].append('Ctrl+C during cleanup verification' if isinstance(exc, KeyboardInterrupt)
+                                        else f'Cleanup verification: {exc}')
+            finally:
+                result['raw_measure_response'] = response.hex(' ')
+        result['status'] = 'failed' if result['errors'] else 'acknowledged'
+        if result['errors']:
+            display('Warning: trigger cleanup failed: ' + '; '.join(result['errors']), warning=True)
+    finally:
+        if main_thread:
+            signal.signal(signal.SIGINT, previous_handler)
+    return result
+
+
 def _paths(args, kind, started):
     if args.no_csv:
         return None, None
@@ -286,6 +367,7 @@ def run_sweep(args, *, version='unknown'):
             print(command)
         for index, point in enumerate(points, 1):
             print(f'{index:5d} [{point.leg}] {point.command(args.pdo_index)}')
+        print('Exit cleanup: ' + ('keep last request' if args.keep_trigger else 'reset -> pdm close'))
         print(f'ADC reads per target: {measurements}; minimum hold: {args.apdo_voltage_hold:g}s; '
               f'ASCII reply window: {args.wait:g}s')
         return 0
@@ -293,6 +375,7 @@ def run_sweep(args, *, version='unknown'):
     path, meta_path = _paths(args, kind, started)
     status, error = 'completed', None
     setup_replies = []
+    cleanup = None
     sent, completed, rows, last_voltage = 0, 0, 0, None
     origin = time.monotonic()
     with ExitStack() as stack:
@@ -322,9 +405,9 @@ def run_sweep(args, *, version='unknown'):
                 writer.writerow(row)
                 handle.flush()
 
+        adc = None
         try:
             initialize_trigger(serial, args, setup_replies)
-            adc = None
             if measurements:
                 adc_args = argparse.Namespace(**vars(args))
                 adc_args.command, adc_args.transport, adc_args.port = 'adc', args.measurement_transport, None
@@ -397,6 +480,11 @@ def run_sweep(args, *, version='unknown'):
             status, error = 'failed', str(exc)
             raise
         finally:
+            # Cleanup runs before files or host connections close, on success,
+            # Ctrl+C and failures (including partially written PD requests).
+            cleanup = release_trigger(serial, args, adc)
+            if cleanup['status'] == 'failed' and status == 'completed':
+                status, error = 'failed', 'Trigger cleanup failed: ' + '; '.join(cleanup['errors'])
             if meta_path:
                 info = dict(device='KM003C', cli_version=version, status=status, error=error,
                             started_at=started.isoformat(), elapsed_s=time.monotonic() - origin,
@@ -407,10 +495,13 @@ def run_sweep(args, *, version='unknown'):
                             measurement_clock='host timestamps; independent ADC observations, not PD waveform timing',
                             planned_points=len(points), sent_requests=sent, completed_points=completed,
                             rows=rows, last_requested_voltage_V=last_voltage, setup=setup_replies,
-                            stop_policy='close host connections; no reset/close command is sent to the trigger')
+                            stop_policy='keep last request' if args.keep_trigger else 'reset then pdm close; external load unchanged',
+                            cleanup=cleanup)
                 meta_path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f'Sweep {status}: {completed}/{len(points)} points; {sent} requests sent')
     if path:
         print(f'Sweep CSV: {path.resolve()}')
         print(f'Metadata: {meta_path.resolve()}')
+    if status == 'failed':
+        raise ProtocolError(error)
     return 130 if status == 'interrupted' else 0

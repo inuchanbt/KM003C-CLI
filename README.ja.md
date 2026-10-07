@@ -274,13 +274,14 @@ KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo`
 | `--csv` / `--no-csv` | 省略時は日時入りの captures/km003c_*_sweep_*.csv を作成 / 保存なし |
 | `--csv-overwrite` / `--csv-append` | 指定 CSV の上書き / 同じ列構成への追記。既定は既存ファイルを拒否 |
 | `--source-name` / `--cable-name` / `--test-note` | ASD 形式の記録用ラベル |
+| `--keep-trigger` | 終了後も最後の PD 要求を維持。既定は無効（reset + pdm close） |
 | `--quiet` / `--dry-run` | 進捗表示を省略 / 全計画のみ表示 |
 
 `--continuous-sweep` は **KM003C の電子負荷を制御しません**。式の電流は PD 要求電流です。実際の消費電流は接続した外部負荷で決まります。ASD の電子負荷 ON/OFF、初回の負荷電流ランプ、プリチェック関連のオプションは、このコマンドには含めません。
 
 CSV は ASD と共通の `target_voltage_v`、`request_current_a`、`actual_voltage_v`、`actual_current_a`、`sweep_leg`、`sweep_pass` などに、KM の要求文・応答生バイト・状態を追加した**掃引用の列構成**です。電子負荷の目標値は空欄で、ASD の全 CSV 列との完全一致ではありません。`capture` の EZ-PD 用 CSV とは別形式です。メタデータは `<CSV>.metadata.json`、追記時は既存情報を残すため `<CSV>.run_<日時>.metadata.json` に保存します。
 
-Ctrl+C は途中の要求・応答・CSV を残して COM/ADC 接続を閉じます。自動の `reset` や `pdm close` は送らないため、終了後の電源状態は機器の状態機械に従います。空の応答は成功扱いにせず、CSV は `sent_unverified` と記録します。行頭の error / failed / false / reject 応答では停止し、その他の応答形式は未確認として保持します。ADC は保持中の測定値で、PD 遷移波形の時間解析には `capture` を使ってください。**掃引の電圧変更と CDC＋USB ADC の併用は実機未検証です。CDC の初期化・PDO 取得と HID ADC の併用は確認済みです。**
+正常終了・Ctrl+C・エラー時は、接続を閉じる前に `reset` → `pdm close` を送ります。実機では `pdm close` 単独で24 Vが残る場合があり、その後の reset/close 試験では15 Vの AVS 要求から約5.12 Vへ戻ることを確認しました。この試験時の外部負荷電流はほぼ0 Aです。各後処理コマンドの応答待ちは2秒です。後処理中の追加 Ctrl+C は一時的に保留し、終了後に元のハンドラーを戻します。応答生バイト・失敗はメタデータの `cleanup` に別途記録し、元の掃引エラーを置き換えません。正常完了した掃引でも後処理に失敗すればエラー終了します。測定用接続がある場合は最後に ADC を1回読み、5.5 V以下か確認します。この測定は掃引 CSV の行に加えず、メタデータに保存します。測定用接続がない場合はコマンド応答のみを記録し、電圧復帰の実測確認はしません。`--keep-trigger` を明示した場合だけ最後の要求を維持します。既定は無効です。**外部電子負荷の ON/OFF や電流設定は変更しません。**空の応答は成功扱いにせず、CSV は `sent_unverified` と記録します。行頭の error / failed / false / reject 応答では停止し、その他の応答形式は未確認として保持します。ADC は保持中の測定値で、PD 遷移波形の時間解析には `capture` を使ってください。**掃引の電圧変更と CDC＋USB ADC の併用は実機未検証です。CDC の初期化・PDO 取得と HID ADC の併用は確認済みです。**
 
 ## 構成と検証
 
