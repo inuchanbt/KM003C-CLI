@@ -89,7 +89,7 @@ def add_sweep_options(parser, connection_options, positive_float, nonnegative_fl
     parser.add_argument('--measurement-transport', choices=['hid', 'usb'], default='hid')
     add_trigger_options(parser, positive_float, nonnegative_float)
     parser.add_argument('--pause-before-sweep', action='store_true',
-                        help='wait for Enter after initialization, before the first voltage request; configure external load manually')
+                        help='request the starting PPS/AVS voltage, then wait for Enter before sweeping; configure external load manually')
     parser.add_argument('--dry-run', action='store_true', help='print plan; no hardware or files')
     output = parser.add_mutually_exclusive_group()
     output.add_argument('--csv', help='default: unique sweep filename in captures/')
@@ -405,6 +405,7 @@ def run_sweep(args, *, version='unknown'):
         for command in setup:
             print(command)
         if args.pause_before_sweep:
+            print(f'Prepare {kind.upper()} at starting voltage: {points[0].command(args.pdo_index)}')
             print('Pause before sweep: configure external load, then press Enter (not waiting in dry-run)')
         for index, point in enumerate(points, 1):
             print(f'{index:5d} [{point.leg}] {point.command(args.pdo_index)}')
@@ -459,11 +460,37 @@ def run_sweep(args, *, version='unknown'):
                 adc = stack.enter_context(Meter(adc_args))
 
             if args.pause_before_sweep:
+                # Select the APDO at the starting voltage before the user raises
+                # the load. Keep this preparation exchange outside sweep rows.
+                preparation_origin = time.monotonic()
+                entry = dict(command=points[0].command(args.pdo_index),
+                             phase='pre_sweep', status='send_failed')
+                setup_replies.append(entry)
+                response = bytearray()
+                try:
+                    if not args.quiet:
+                        print(f'Prepare {kind.upper()} at starting voltage: {entry["command"]}', flush=True)
+                    serial.write(encode_ascii_command(entry['command']))
+                    last_voltage = points[0].voltage_mv / 1000
+                    entry['status'] = 'sent_response_read_failed'
+                    _read_reply(serial, args.wait, response)
+                    if _rejects(response):
+                        entry['status'] = 'device_rejected'
+                        raise ProtocolError(f'Device rejected pre-sweep target {last_voltage:g} V')
+                    entry['status'] = 'sent_unverified'
+                    if args.continuous_sweep and args.continuous_settle:
+                        time.sleep(args.continuous_settle)
+                    remaining = args.apdo_voltage_hold - (time.monotonic() - preparation_origin)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                finally:
+                    entry['response_hex'] = response.hex(' ')
                 pause_origin = time.monotonic()
                 pause['status'] = 'waiting'
                 try:
-                    input('Sweep preparation complete. Configure external electronic load '
-                          f'(PD request: {points[0].current_ma / 1000:g} A), '
+                    input(f'{kind.upper()} starting-voltage request sent '
+                          f'({points[0].voltage_mv / 1000:g} V, {points[0].current_ma / 1000:g} A). '
+                          'Configure external electronic load, '
                           'then press Enter to start sweep (Ctrl+C to cancel): ')
                 except EOFError as exc:
                     pause['status'] = 'failed'

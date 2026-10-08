@@ -279,13 +279,13 @@ KM003C では **`--pdo-index` が必要**です。メーカー資料に `pd pdo`
 | `--force` / `--csv-overwrite` / `--csv-append` | 前二つは指定 CSV とメタデータを上書き。append は列を検証して追記し、既存メタデータを保持。既定は既存ファイルを拒否 |
 | `--source-name` / `--cable-name` / `--test-note` | ASD 形式の記録用ラベル |
 | `--keep-trigger` | 終了後も最後の PD 要求を維持。既定は無効（reset + pdm close） |
-| `--pause-before-sweep` | 初期化・ADC 接続準備後、最初の電圧要求前に Enter 待ち。既定は無効 |
+| `--pause-before-sweep` | 初期化・ADC 接続準備後、PPS/AVS の開始電圧を要求してから Enter 待ち。既定は無効 |
 | `--quiet` / `--dry-run` | 進捗表示を省略 / 全計画のみ表示 |
 
-PDO 取得中は外部負荷を OFF または低電流にし、本測定の直前に設定したい場合は `--pause-before-sweep` を追加してください。初期化（EPR 能力取得の待機を含む）と ADC 接続の準備が完了した後、最初の掃引要求を送る前に停止します。電子負荷を CC 5 A など目的の電流に設定し、Enter で開始します。`--quiet` でも待機案内は表示します。待機中の Ctrl+C や入力 EOF でも既存の終了処理を実行し、掃引要求は送りません。`--no-initialize` の場合も最初の要求前に停止します。`--dry-run` では停止位置の表示のみで、入力待ちはしません。`--force` は `--csv-overwrite` と同じ指定で、`--csv` が必要です。指定 CSV と `<CSV>.metadata.json` を両方上書きします。
+PDO 取得中は外部負荷を OFF または低電流にし、本測定の直前に設定したい場合は `--pause-before-sweep` を追加してください。初期化（EPR 能力取得の待機を含む）と ADC 接続の準備後、選択した PPS/AVS PDO に掃引の開始電圧・要求電流を送ります。応答を読み、指定された電圧保持時間・continuous-settle を適用してから Enter 待ちに入ります。この間に電子負荷を CC 5 A など目的の電流に設定してください。Enter 後は開始電圧を再要求して掃引を始めるため、掃引の測定は負荷調整後に行います。準備要求と生応答は metadata の `setup` に `phase=pre_sweep` として記録し、掃引 CSV の行や `sent_requests` の件数には含めません。コマンド送信だけでは PD の受理確認にはなりません。`--quiet` でも待機案内は表示します。待機中の Ctrl+C や入力 EOF でも既存の終了処理を実行しますが、開始電圧の準備要求は送信済みです。準備要求が拒否された場合は待機・掃引を開始しません。`--no-initialize` でも開始電圧を要求してから停止します。`--dry-run` はこの順序を表示し、コマンド送信や入力待ちはしません。`--force` は `--csv-overwrite` と同じ指定で、`--csv` が必要です。指定 CSV と `<CSV>.metadata.json` を両方上書きします。
 
 ```powershell
-# 低電流／無負荷で PDO を取得 → 待機中に CC 5 A に設定 → Enter で開始。既存ログは上書き
+# 低電流／無負荷で PDO を取得 → AVS 開始電圧を要求 → CC 5 A に設定 → Enter で掃引。既存ログは上書き
 python km003c_cli.py --port COM14 --mode avs --sweep 15:48:1:5 --pdo-index 11 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --pause-before-sweep --csv captures/avs07.csv --force
 ```
 

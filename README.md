@@ -280,13 +280,13 @@ CDC reads keep the COM configuration fixed instead of changing the serial timeou
 | `--force` / `--csv-overwrite` / `--csv-append` | First two overwrite the explicitly selected CSV and its metadata; append validates the header and preserves prior metadata; default refuses existing files |
 | `--source-name` / `--cable-name` / `--test-note` | ASD-style recording labels |
 | `--keep-trigger` | Keep the last PD request on exit; off by default (reset + pdm close) |
-| `--pause-before-sweep` | Wait for Enter after initialization and ADC connection preparation, before the first voltage request; off by default |
+| `--pause-before-sweep` | Request the starting PPS/AVS voltage after initialization and ADC preparation, then wait for Enter before sweeping; off by default |
 | `--quiet` / `--dry-run` | Suppress progress / print the plan only |
 
-Use `--pause-before-sweep` when the external load must stay off or draw little current during PDO acquisition. After initialization (including the EPR capability wait) and ADC connection preparation, the command waits before sending the first sweep request. Set the external load to the desired CC current, then press Enter. The prompt is also shown with `--quiet`. Ctrl+C or EOF during this wait uses the same exit cleanup as a running sweep; no sweep request is sent. With `--no-initialize`, the pause still occurs before the first request. `--dry-run` prints the pause in the plan without waiting. `--force` is an alias for `--csv-overwrite`, requires `--csv`, and overwrites both that CSV and `<CSV>.metadata.json`.
+Use `--pause-before-sweep` when the external load must stay off or draw little current during PDO acquisition. After initialization (including the EPR capability wait) and ADC connection preparation, the command selects the PPS/AVS PDO using the sweep's starting voltage and request current. It reads the reply, applies the configured starting-voltage hold/continuous settle, then waits for Enter. Set the external load to the desired CC current during this wait. Enter starts the sweep by requesting the starting voltage again, so all sweep measurements occur after load adjustment. The preparation command and raw reply are recorded in metadata `setup` with `phase=pre_sweep`; they do not add a sweep CSV row or count toward `sent_requests`. Command delivery does not verify PD acceptance. The prompt is also shown with `--quiet`. Ctrl+C or EOF during the pause uses the same exit cleanup as a running sweep; the starting-voltage preparation request has already been sent. A rejected preparation request skips the pause and sweep. With `--no-initialize`, the starting-voltage request still precedes the pause. `--dry-run` prints this order without sending commands or waiting. `--force` is an alias for `--csv-overwrite`, requires `--csv`, and overwrites both that CSV and `<CSV>.metadata.json`.
 
 ```powershell
-# Acquire PDOs with low/no load, pause to set CC 5 A, then start; overwrite previous logs
+# Acquire PDOs with low/no load -> request starting AVS voltage -> set CC 5 A -> Enter to sweep
 python km003c_cli.py --port COM14 --mode avs --sweep 15:48:1:5 --pdo-index 11 --continuous-sweep --round-trip-sweep --apdo-voltage-hold 2 --pause-before-sweep --csv captures/avs07.csv --force
 ```
 

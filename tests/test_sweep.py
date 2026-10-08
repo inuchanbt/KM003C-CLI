@@ -98,7 +98,7 @@ class SweepTests(unittest.TestCase):
         with Path(path).open(encoding='utf-8-sig', newline='') as handle:
             return list(csv.DictReader(handle))
 
-    def test_pause_after_epr_and_adc_preparation_before_first_request(self):
+    def test_pause_after_epr_adc_and_starting_avs_request(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'run.csv'; clock=Clock(); meter=self.release_meter()
             class EprSerial(Serial):
@@ -111,7 +111,10 @@ class SweepTests(unittest.TestCase):
             def resume(prompt):
                 self.assertIn('5 A',prompt)
                 self.assertEqual(serial.writes,['pdm open','pdm set type=2,em=2,sink=1',
-                                                'entry pd','pd pdo','pd pdo'])
+                                                'entry pd','pd pdo','pd pdo',
+                                                'pd req=11,volt=15000,cur=5000'])
+                self.assertEqual(serial.pending,[])
+                self.assertGreaterEqual(clock.now,4.0)  # Reply + starting-voltage hold precede input.
                 self.assertEqual(meter.reads,0)
                 self.assertIs(sweep.Meter.return_value,meter)
                 self.assertEqual(sweep.Meter.call_count,1)
@@ -119,15 +122,36 @@ class SweepTests(unittest.TestCase):
                 return ''
             with patch('builtins.input',side_effect=resume) as wait:
                 result,*_=self.execute(self.args('--sweep','15:48:1:5','--continuous-sweep',
-                    '--pause-before-sweep','--csv',str(path),'--no-keep-trigger'),
+                    '--pause-before-sweep','--apdo-voltage-hold','2','--csv',str(path),'--no-keep-trigger'),
                     clock=clock,serial=serial,meter=meter)
             self.assertEqual(result,0)
             self.assertEqual(wait.call_count,1)
-            self.assertTrue(serial.writes[5].startswith('pd req='))
+            self.assertEqual(serial.writes[5:7],['pd req=11,volt=15000,cur=5000']*2)
             info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
             self.assertEqual(info['pause_before_sweep'],dict(status='continued',elapsed_s=7.0))
             self.assertEqual(info['sent_requests'],34)
             self.assertEqual(len(self.rows(path)),34)
+            self.assertEqual(info['setup'][-1],dict(command='pd req=11,volt=15000,cur=5000',
+                phase='pre_sweep',status='sent_unverified',response_hex=b'OK\r\n'.hex(' ')))
+
+    def test_pps_starting_request_precedes_pause_and_sweep(self):
+        args=cli.build_arg_parser().parse_args(['sweep','--pps-sweep','5:7:1:3',
+            '--pdo-index','4','--pause-before-sweep','--wait','.1','--quiet','--no-csv'])
+        clock=Clock();serial=Serial(clock)
+        def resume(prompt):
+            self.assertIn('PPS',prompt)
+            self.assertIn('5 V, 3 A',prompt)
+            self.assertEqual(serial.writes,['pdm open','pdm set type=1,em=1,sink=1',
+                'entry pd','pd pdo','pd req=4,volt=5000,cur=3000'])
+            self.assertEqual(serial.pending,[])
+            return ''
+        with patch('builtins.input',side_effect=resume) as wait:
+            result,*_=self.execute(args,clock=clock,serial=serial)
+        self.assertEqual(result,0)
+        self.assertEqual(wait.call_count,1)
+        self.assertEqual(serial.writes[4:8],['pd req=4,volt=5000,cur=3000',
+            'pd req=4,volt=5000,cur=3000','pd req=4,volt=6000,cur=3000',
+            'pd req=4,volt=7000,cur=3000'])
 
     def test_quiet_pause_prompt_visible_and_no_init_supported(self):
         output=io.StringIO();clock=Clock();serial=Serial(clock)
@@ -136,7 +160,9 @@ class SweepTests(unittest.TestCase):
                                    clock=clock,serial=serial,output=output)
         self.assertEqual(result,0)
         self.assertIn('press Enter to start sweep',output.getvalue())
-        self.assertTrue(all(c.startswith('pd req=') for c in serial.writes))
+        self.assertIn('AVS starting-voltage request sent',output.getvalue())
+        self.assertEqual(serial.writes,['pd req=11,volt=15000,cur=5000']*2+
+            ['pd req=11,volt=16000,cur=5000','pd req=11,volt=17000,cur=5000'])
 
     def test_pause_interrupt_and_eof_release_without_sweep_requests(self):
         for exception in (KeyboardInterrupt(),EOFError()):
@@ -152,14 +178,46 @@ class SweepTests(unittest.TestCase):
                         with self.assertRaisesRegex(ProtocolError,'no Enter received'):
                             self.execute(args,clock=clock,serial=serial,meter=meter)
                 self.assertEqual(serial.writes[-2:],['reset','pdm close'])
-                self.assertFalse(any(c.startswith('pd req=') for c in serial.writes))
+                self.assertEqual([c for c in serial.writes if c.startswith('pd req=')],
+                                 ['pd req=11,volt=15000,cur=5000'])
                 self.assertEqual((serial.closes,meter.closes),(1,1))
                 self.assertEqual(self.rows(path),[])
                 info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
                 self.assertEqual(info['sent_requests'],0)
+                self.assertEqual(info['last_requested_voltage_V'],15)
+                self.assertEqual(info['setup'][-1]['phase'],'pre_sweep')
                 self.assertEqual(info['pause_before_sweep']['status'],
                                  'interrupted' if isinstance(exception,KeyboardInterrupt) else 'failed')
                 self.assertEqual(info['cleanup']['status'],'acknowledged')
+
+    def test_starting_request_failure_skips_pause_and_sweep_and_retains_evidence(self):
+        command='pd req=11,volt=15000,cur=5000'
+        for failure in ('write','reject','read','interrupt'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)/'run.csv';clock=Clock()
+                reply={'reject':b'error: request rejected\n',
+                       'read':[b'partial',OSError('read failed')],
+                       'interrupt':[b'partial',KeyboardInterrupt()]}.get(failure,b'OK\n')
+                serial=Serial(clock,{command:reply},fail_write=command if failure=='write' else None)
+                with patch('builtins.input',side_effect=AssertionError('unexpected pause')):
+                    args=self.args('--pause-before-sweep','--no-keep-trigger','--csv',str(path))
+                    if failure=='interrupt':
+                        result,*_=self.execute(args,clock=clock,serial=serial)
+                        self.assertEqual(result,130)
+                    else:
+                        with self.assertRaises((OSError,ProtocolError)):
+                            self.execute(args,clock=clock,serial=serial)
+                self.assertEqual(serial.writes[-2:],['reset','pdm close'])
+                self.assertEqual(self.rows(path),[])
+                info=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+                self.assertEqual(info['sent_requests'],0)
+                self.assertEqual(info['pause_before_sweep']['status'],'not_requested')
+                entry=info['setup'][-1]
+                self.assertEqual(entry['phase'],'pre_sweep')
+                self.assertEqual(entry['status'],{'write':'send_failed','reject':'device_rejected',
+                    'read':'sent_response_read_failed','interrupt':'sent_response_read_failed'}[failure])
+                self.assertEqual(entry['response_hex'],
+                    (b'' if failure=='write' else reply if failure=='reject' else b'partial').hex(' '))
 
     def test_pause_not_reached_on_failed_preparation_and_off_by_default(self):
         with patch('builtins.input',side_effect=AssertionError('unexpected pause')):
@@ -186,8 +244,9 @@ class SweepTests(unittest.TestCase):
                 self.assertEqual(cli.main(['--mode','avs','--sweep','15:17:1:5','--pdo-index','11',
                     '--pause-before-sweep','--force','--csv',str(path),'--dry-run']),0)
             text=output.getvalue()
-            self.assertLess(text.index('pd pdo'),text.index('Pause before sweep'))
-            self.assertLess(text.index('Pause before sweep'),text.index('pd req='))
+            self.assertLess(text.index('pd pdo'),text.index('Prepare AVS'))
+            self.assertLess(text.index('Prepare AVS'),text.index('Pause before sweep'))
+            self.assertLess(text.index('Pause before sweep'),text.index('    1 [outbound]'))
             self.assertEqual(path.read_text(encoding='utf-8'),'old log')
             self.assertEqual(meta.read_text(encoding='utf-8'),'old metadata')
 
