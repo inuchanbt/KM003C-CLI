@@ -24,8 +24,8 @@ from km003c_modules.protocol import (
 from km003c_modules.transport import Meter, CdcStream, ascii_command, enumerate_devices, format_ascii_response
 from km003c_modules.utility_export import UtilityExport, packet_for_event, packet_for_vbus_event
 from km003c_modules.vbus_events import VbusEventDetector
-from km003c_modules.transitions import (TransitionSession, TRANSITION_OUTPUT_SUFFIXES,
-    add_analysis_options, run_analysis, load_analysis_csv, print_analysis_outputs)
+from km003c_modules.transitions import (TransitionSession, analysis_output_suffixes,
+    add_analysis_options, run_analysis, load_analysis_csv, print_analysis_outputs, require_transition_plotting)
 
 from km003c_modules.sweep import add_sweep_options, validate_sweep, run_sweep as execute_sweep
 
@@ -128,7 +128,7 @@ def gui_output_options(parser):
                              '4.0V/0.8V thresholds, no initial event or inference across gaps >100ms; '
                              'requires scope; saves GUI rows and .vbus_events.jsonl')
     parser.add_argument('--analyze-transitions', action='store_true',
-                        help='analyze EPR AVS voltage transitions after capture/conversion (default: off; requires scope)')
+                        help='analyze SPR PPS/AVS and EPR AVS transitions after capture/conversion (default: off; requires scope)')
     add_analysis_options(parser, positive_float, nonnegative_float, positive_int)
 
 
@@ -200,7 +200,7 @@ def build_arg_parser():
     p.add_argument('--allow-framing-errors', action='store_true')
     p.set_defaults(func=run_export)
 
-    p = sub.add_parser('analyze-sync', help='offline EPR AVS analysis of KM003C PD and scope CSV')
+    p = sub.add_parser('analyze-sync', help='offline PPS/AVS transition analysis of KM003C PD and scope CSV')
     p.add_argument('--pd-csv', required=True)
     p.add_argument('--scope-csv', required=True)
     p.add_argument('--out-prefix', default='km003c_sync_analysis')
@@ -556,7 +556,7 @@ def capture_output_paths(args, *, live):
     formats = output_formats(args)
     suffixes = ['.metadata.json', '.summary.txt']
     if args.analyze_transitions:
-        suffixes.extend(TRANSITION_OUTPUT_SUFFIXES)
+        suffixes.extend(analysis_output_suffixes(args))
     if args.infer_vbus_events:
         suffixes.append('.vbus_events.jsonl')
     if 'csv' in formats:
@@ -596,7 +596,7 @@ def print_capture_outputs(export):
         print(f'Inferred VBUS events: {export.prefix.with_suffix(".vbus_events.jsonl").resolve()} '
               f'({sum(export.detector.counts.values())} estimates)')
     if export.transition_session:
-        print_analysis_outputs(export.analyses, export.prefix)
+        print_analysis_outputs(export.analyses, export.prefix, export.analysis_info.get('settings'))
 
 
 class CaptureExport:
@@ -779,7 +779,7 @@ class CaptureExport:
                    f'GUI PD messages: {self.gui_events}', f'GUI omitted events: {dict(self.gui_omitted)}',
                    f'GUI inferred VBUS events: {self.gui_inferred_events}',
                    f'VBUS inference: {self.detector.summary() if self.detector else {"enabled": False}}',
-                   f'AVS transition analysis: {self.analysis_info}',
+                   f'PPS/AVS transition analysis: {self.analysis_info}',
                    f'CCGX3 waveform samples: {self.utility.scope_count}',
                    'CRC/EOP, wire duration and delta: not exposed',
                    'Start Time == End Time: one observed event timestamp, not physical wire start/end',
@@ -851,15 +851,15 @@ def run_export(args):
 def run_analyze_sync(args):
     inputs = {Path(path).expanduser().resolve() for path in (args.pd_csv, args.scope_csv)}
     prefix = Path(args.out_prefix).expanduser()
-    for suffix in TRANSITION_OUTPUT_SUFFIXES:
+    for suffix in analysis_output_suffixes(args):
         path = prefix.with_suffix(suffix)
         if path.resolve() in inputs:
             raise ValueError('Analysis output would overwrite an input CSV')
         if path.exists() and (not args.force or path.is_dir()):
             raise FileExistsError(f'{path} exists; choose another prefix or use --force')
     pd, scope = load_analysis_csv(args.pd_csv, args.scope_csv)
-    analyses, _ = run_analysis(pd, scope, args)
-    print_analysis_outputs(analyses, prefix)
+    analyses, settings = run_analysis(pd, scope, args)
+    print_analysis_outputs(analyses, prefix, settings)
     return 0
 
 
@@ -879,6 +879,13 @@ def validate_args(args, parser):
         parser.error('--infer-vbus-events requires --scope')
     if getattr(args, 'analyze_transitions', False) and not args.scope:
         parser.error('--analyze-transitions requires --scope')
+    if getattr(args, 'transition_plots', False):
+        if args.command != 'analyze-sync' and not getattr(args, 'analyze_transitions', False):
+            parser.error('--transition-plots requires --analyze-transitions')
+        try:
+            require_transition_plotting()
+        except ValueError as exc:
+            parser.error(str(exc))
     if hasattr(args, 'baseline_guard_ms') and args.baseline_guard_ms >= args.baseline_window_ms:
         parser.error('--baseline-guard-ms must be smaller than --baseline-window-ms')
     if args.func is run_ascii:

@@ -87,6 +87,18 @@ class AVSTransitionAnalysis:
     observed_settling_latency_us: Optional[int]
     observed_average_slew_V_per_s: Optional[float]
     flags: tuple[str, ...]
+    supply_type: str = 'EPR_AVS'
+    request_message: str = 'EPR_REQUEST'
+    pdo_object_position: Optional[int] = None
+    selected_pdo: Optional[int] = None
+
+    @property
+    def request_mode(self) -> str:
+        return self.supply_type
+
+    @property
+    def object_position(self) -> Optional[int]:
+        return self.pdo_object_position
 
 
 def _median(values: Sequence[float]) -> float:
@@ -136,6 +148,71 @@ def _decode_avs_request_from_pd_sample(pd):
     return ((rdo >> 9) & 0xFFF) * 0.025, (rdo & 0x7F) * 0.05
 
 
+@dataclass(frozen=True)
+class ProgrammableRequest:
+    voltage_V: float
+    current_A: float
+    supply_type: str
+    object_position: int
+    selected_pdo: int
+
+
+RESET_MESSAGES = frozenset(('SOFT_RESET', 'HARD_RESET', 'VBUS_DN', 'DETACH', 'CONNECT', 'DISCONNECT'))
+REQUEST_MESSAGES = frozenset(('REQUEST', 'EPR_REQUEST'))
+STOP_MESSAGES = RESET_MESSAGES | frozenset(('REJECT', 'WAIT', 'NOT_SUPPORTED'))
+
+
+def decode_programmable_requests(pd_samples):
+    """Resolve each SPR RDO against the most recent captured Source Capabilities.
+
+    PPS uses an 11-bit 20 mV voltage field; SPR/EPR AVS use 12-bit 25 mV.
+    APDO subtypes and RDO units agree with Linux include/linux/usb/pd.h.
+    Never infer the PDO type from the requested voltage or a future advert.
+    """
+    source_pdos = []
+    decoded, skipped = {}, {}
+    for index, sample in enumerate(pd_samples):
+        if sample.message in RESET_MESSAGES:
+            source_pdos = []
+        if sample.message == 'SOURCE_CAPABILITIES':
+            data = sample.data
+            source_pdos = ([int.from_bytes(data[n:n + 4], 'little') for n in range(0, len(data), 4)]
+                           if 0 < len(data) <= 28 and len(data) % 4 == 0 else [])
+        if sample.message not in REQUEST_MESSAGES:
+            continue
+        reason = None
+        if sample.message == 'EPR_REQUEST':
+            values = _decode_avs_request_from_pd_sample(sample)
+            if values is not None:
+                rdo = int.from_bytes(sample.data[:4], 'little')
+                decoded[index] = ProgrammableRequest(*values, 'EPR_AVS', (rdo >> 28) & 15,
+                                                    int.from_bytes(sample.data[4:], 'little'))
+            else:
+                reason = 'unsupported_or_truncated_epr_request'
+        elif len(sample.data) != 4:
+            reason = 'truncated_or_invalid_spr_request'
+        else:
+            rdo = int.from_bytes(sample.data, 'little')
+            position = (rdo >> 28) & 15
+            if not source_pdos:
+                reason = 'source_capabilities_missing'
+            elif not 1 <= position <= len(source_pdos):
+                reason = 'pdo_object_position_unavailable'
+            else:
+                pdo = source_pdos[position - 1]
+                subtype = pdo >> 28
+                if subtype in (0xC, 0xE):
+                    step, mask, kind = ((.020, 0x7FF, 'SPR_PPS') if subtype == 0xC
+                                        else (.025, 0xFFF, 'SPR_AVS'))
+                    decoded[index] = ProgrammableRequest(((rdo >> 9) & mask) * step,
+                        (rdo & 0x7F) * .05, kind, position, pdo)
+                else:
+                    reason = 'non_programmable_or_unsupported_spr_pdo'
+        if reason:
+            skipped[reason] = skipped.get(reason, 0) + 1
+    return decoded, skipped
+
+
 
 def analyze_avs_transitions(
     pd_samples: Sequence[SyncPDSample],
@@ -158,17 +235,17 @@ def analyze_avs_transitions(
     plateau_target_guard_fraction: float = TRANSITION_PLATEAU_TARGET_GUARD_FRACTION,
 ) -> list[AVSTransitionAnalysis]:
     """
-    Correlate PD EPR_REQUEST/ACCEPT/PS_RDY messages with measurement telemetry.
+    Correlate SPR PPS/AVS REQUEST and EPR AVS EPR_REQUEST with telemetry.
 
     No host-time offset is estimated or applied. Both streams are compared on
     the raw/unwrapped device microsecond timestamps exactly as captured.
 
     Matching:
-      - For each AVS EPR_REQUEST, walk forward in PD order.
+      - For each decoded programmable request, walk forward in PD order.
       - ACCEPT is the first ACCEPT after the request and before the next
-        EPR_REQUEST.
+        REQUEST/EPR_REQUEST or rejection/reset.
       - PS_RDY is the first PS_RDY after that ACCEPT (or request if ACCEPT is
-        absent) and before the next EPR_REQUEST.
+        absent) and before the next request or rejection/reset.
 
     Movement detection:
       - baseline = median measurement VBUS in [request-baseline_window,
@@ -202,19 +279,20 @@ def analyze_avs_transitions(
         reported side-by-side.
     """
     pd_rows = list(pd_samples)
+    requests, _ = decode_programmable_requests(pd_rows)
     scope = sorted(scope_samples, key=lambda s: s.timestamp_us)
     results: list[AVSTransitionAnalysis] = []
 
     for i, req in enumerate(pd_rows):
-        decoded_req = _decode_avs_request_from_pd_sample(req)
+        decoded_req = requests.get(i)
         if decoded_req is None:
             continue
 
-        target_v, requested_current = decoded_req
+        target_v, requested_current = decoded_req.voltage_V, decoded_req.current_A
 
         next_req_index = len(pd_rows)
         for k in range(i + 1, len(pd_rows)):
-            if pd_rows[k].message == "EPR_REQUEST":
+            if pd_rows[k].message in REQUEST_MESSAGES | STOP_MESSAGES:
                 next_req_index = k
                 break
 
@@ -231,7 +309,10 @@ def analyze_avs_transitions(
                 ps_rdy = candidate
                 break
 
-        flags: list[str] = []
+        flags: list[str] = ['protocol_' + decoded_req.supply_type.lower(),
+                            f'pdo_object_position_{decoded_req.object_position}']
+        if next_req_index < len(pd_rows) and pd_rows[next_req_index].message in STOP_MESSAGES:
+            flags.append('terminated_' + pd_rows[next_req_index].message.lower())
         nearest_req = _nearest_scope_sample(scope, req.start_us)
         nearest_ps = (
             _nearest_scope_sample(scope, ps_rdy.start_us)
@@ -245,6 +326,10 @@ def analyze_avs_transitions(
             nearest_ps = None
 
         baseline_start = req.start_us - int(baseline_window_us)
+        for previous in reversed(pd_rows[:i]):
+            if previous.message in RESET_MESSAGES:
+                baseline_start = max(baseline_start, previous.start_us)
+                break
         baseline_end = req.start_us - int(baseline_guard_us)
         baseline_samples = [
             s.vbus_V for s in scope
@@ -667,6 +752,10 @@ def analyze_avs_transitions(
                 ),
                 observed_average_slew_V_per_s=observed_average_slew,
                 flags=tuple(dict.fromkeys(flags)),
+                supply_type=decoded_req.supply_type,
+                request_message=req.message,
+                pdo_object_position=decoded_req.object_position,
+                selected_pdo=decoded_req.selected_pdo,
             )
         )
 

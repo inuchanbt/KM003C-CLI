@@ -228,7 +228,7 @@ class TransitionTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()) as console:
                 self.assertEqual(cli.main(['convert', '--input', str(source), '--out-prefix', str(root / 'empty'),
                                            '--analyze-transitions']), 0)
-            self.assertIn('No AVS EPR_REQUEST', console.getvalue())
+            self.assertIn('No decodable SPR PPS/AVS or EPR AVS', console.getvalue())
             with (root / 'empty.transitions.csv').open(encoding='utf-8-sig') as handle:
                 self.assertEqual(list(csv.DictReader(handle)), [])
 
@@ -268,7 +268,10 @@ class TransitionTests(unittest.TestCase):
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         # Compare common results with explicit sampling limits; new KM flags are added by the adapter only.
-        ref = module.analyze_avs_transitions(avs_pd(), wave(), movement_sustain_samples=2,
+        reference_pd = [module.SyncPDSample(row_index=p.row_index, sno=p.sno, message=p.message,
+                       start_us=p.start_us, end_us=p.end_us, vbus_V=p.vbus_V, data=p.data)
+                        for p in avs_pd()]
+        ref = module.analyze_avs_transitions(reference_pd, wave(), movement_sustain_samples=2,
               settle_hold_us=80000, settle_max_sample_gap_us=100000, plateau_lookback_us=400000,
               plateau_min_samples=6, observed_settle_hold_us=80000)[0]
         own = analyze_avs_transitions(avs_pd(), wave())[0]

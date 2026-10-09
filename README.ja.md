@@ -81,11 +81,14 @@ python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus
 
 時刻はしきい値を超えた最初の測定点で、1 ms のデバイス分解能とポーリング間隔（既定 40 ms）による不確かさがあります。KM003C のハードウェアイベントではなくソフトウェア推定で、測定点の間の変化は見逃す場合があります。コンソールには `[VBUS inferred]` と表示します。選択した GUI 出力には電圧イベント行（`Ok=VBUS_UP/DN`、Utility の `VOLT_PKT` 形式）を追加し、PD メッセージは捏造しません。GUI の行だけでは実機 VBUS イベントと区別できないため、共有時は `.vbus_events.jsonl` と metadata も添付してください。この JSONL は `--formats original` でも必ず生成し、`estimated`・出所・しきい値・測定区間・GUI 行との対応を記録します。metadata の `vbus_event_inference` はしきい値・件数・間隔リセット数を記録し、`gui_pd_messages` は推定を除外、`gui_rows` は推定行を含めます。生フレーム・元の JSONL・測定点・実機 PD 件数は変更しません。
 
-### AVS 遷移解析
+### SPR PPS／AVS 遷移解析
 
 ```powershell
 # Ctrl+C まで取得。出力名は captures/km003c_<日時> を自動生成。
 python km003c_cli.py capture --analyze-transitions
+
+# 電圧波形・応答/整定時間・推定スルーレートのグラフも生成。
+python km003c_cli.py capture --scope --analyze-transitions --transition-plots --out-prefix captures/pps_avs
 
 # 10 秒で終了。VBUS UP/DN 推定は独立した任意機能。
 python km003c_cli.py capture --seconds 10 --analyze-transitions --infer-vbus-events --out-prefix captures/avs01
@@ -95,9 +98,14 @@ python km003c_cli.py convert --input captures/avs01.records.bin --analyze-transi
 
 # 同じ KM003C キャプチャの PD/scope CSV を CY4500 と同じ形式で解析。
 python km003c_cli.py analyze-sync --pd-csv captures/avs01.csv --scope-csv captures/avs01.scope.csv --out-prefix captures/avs_csv
+
+# 保存済みの PD/scope CSV からグラフも生成。
+python km003c_cli.py analyze-sync --pd-csv captures/avs01.csv --scope-csv captures/avs01.scope.csv --transition-plots --out-prefix captures/avs_plots
 ```
 
-`--analyze-transitions` は既定で無効、scope が必要です。取得終了時（Ctrl+C を含む）またはオフライン変換後に解析します。RDO と選択された EPR AVS PDO を含む `EPR_REQUEST` だけを対象とし、次の要求までの SOP ACCEPT/PS_RDY を対応付け、基準電圧・変化方向と開始点・目標電圧通過・目標帯への整定・観測した平坦部・平均スルーレートを推定します。固定電圧/PPS/SPR-AVS 要求は対象外です。空データや AVS 要求がない記録でも、列名付きのレポートと対象なしの説明を生成します。解析用入力を一時ファイルへ保存するため、どの `--formats` 選択でも使え、生データ・測定値は変更しません。`analyze-sync` には同じ取得のデバイス時刻付き PD/scope CSV が必要です。単独 `scope` のホスト時刻 CSV は対応付けできません。
+`--analyze-transitions` は既定で無効、scope が必要です。取得終了時（Ctrl+C を含む）またはオフライン変換後に解析します。SPR PPS／SPR AVS の `REQUEST` と EPR AVS の `EPR_REQUEST` に対応します。SPR は直前の SOP `SOURCE_CAPABILITIES` の選択 PDO と照合するため、能力通知より前から取得してください。PDO 情報不足や固定電圧などの対象外要求は除外し、理由別件数を記録します。EPR は要求に含まれる選択 PDO を使用します。次の要求または拒否・リセットまでの SOP ACCEPT/PS_RDY を対応付け、基準電圧・変化方向と開始点・目標電圧通過・目標帯への整定・観測した平坦部・平均スルーレートを推定します。空データや対象要求がない記録でも、列名付きのレポートと対象なしの説明を生成します。解析用入力を一時ファイルへ保存するため、どの `--formats` 選択でも使え、生データ・測定値は変更しません。`analyze-sync` には同じ取得のデバイス時刻付き PD/scope CSV が必要です。単独 `scope` のホスト時刻 CSV は対応付けできません。
+
+解析を有効にした capture/convert または `analyze-sync` に `--transition-plots` を付けると、`.transitions.png`（測定 VBUS・要求目標・Request/ACCEPT/PS_RDY）、`.transition_timing.png`（応答・整定時間）、`.transition_slew.png`（推定スルーレート）の 3 枚を生成します。事前に `python -m pip install -r requirements-analysis.txt` で追加依存を導入してください。波形の欠測区間は線でつながず、取得できない時間・スルーレートは描画しません。CSV に `request_mode`・`request_message`・`object_position` も出力します。遷移解析には PD/scope の同時記録が必要です。別機能の掃引 CSV 解析だけでは PD 応答時間を復元できません。
 
 出力は CY4500 と同じ列名・順序の `.transitions.csv`、`.transitions.txt`、`.transition_summary.csv`、`.transition_summary.txt` です。capture・変換の metadata に設定・解析状態・件数・要求番号の基準を記録します。単独 analyze-sync はテキストレポートに設定を記録します。要約では要求目標と観測した平坦部を別々に示します。CSV の flags に KM003C の点時刻・離散測定・データ不足・中断/失敗を記録します。デバイス分解能は 1 ms、既定ポーリングは 40 ms なので、遅延やスルーレートは推定値であり、速い変化は見逃す場合があります。物理的な USB-PD タイミング規格適合の判定には使えません。測定点や時刻オフセットは捏造しません。長い空きや重複時刻では連続した変化・整定の判定を区切り、安定したデータが足りなければ平坦部・整定の値は空欄にします。要求/PS_RDY の近傍測定が許容間隔より遠ければ、対応電圧を未取得とします。
 
@@ -294,6 +302,22 @@ python km003c_cli.py --port COM14 --mode avs --sweep 15:48:1:5 --pdo-index 11 --
 CSV は ASD と共通の `target_voltage_v`、`request_current_a`、`actual_voltage_v`、`actual_current_a`、`sweep_leg`、`sweep_pass` などに、KM の要求文・応答生バイト・状態を追加した**掃引用の列構成**です。電子負荷の目標値は空欄で、ASD の全 CSV 列との完全一致ではありません。`capture` の EZ-PD 用 CSV とは別形式です。メタデータは `<CSV>.metadata.json`、追記時は既存情報を残すため `<CSV>.run_<日時>.metadata.json` に保存します。
 
 正常終了・Ctrl+C・エラー時は、接続を閉じる前に `reset` → `pdm close` を送ります。実機では `pdm close` 単独で24 Vが残る場合があり、その後の reset/close 試験では15 Vの AVS 要求から約5.12 Vへ戻ることを確認しました。この試験時の外部負荷電流はほぼ0 Aです。各後処理コマンドの応答待ちは2秒です。後処理中の追加 Ctrl+C は一時的に保留し、終了後に元のハンドラーを戻します。応答生バイト・失敗はメタデータの `cleanup` に別途記録し、元の掃引エラーを置き換えません。正常完了した掃引でも後処理に失敗すればエラー終了します。測定用接続がある場合は最後に ADC を1回読み、5.5 V以下か確認します。この測定は掃引 CSV の行に加えず、メタデータに保存します。測定用接続がない場合はコマンド応答のみを記録し、電圧復帰の実測確認はしません。`--keep-trigger` を明示した場合だけ最後の要求を維持します。既定は無効です。**外部電子負荷の ON/OFF や電流設定は変更しません。**空の応答は成功扱いにせず、CSV は `sent_unverified` と記録します。行頭の error / failed / false / reject 応答では停止し、その他の応答形式は未確認として保持します。ADC は保持中の測定値で、PD 遷移波形の時間解析には `capture` を使ってください。**掃引の電圧変更と CDC＋USB ADC の併用は実機未検証です。CDC の初期化・PDO 取得と HID ADC の併用は確認済みです。**
+
+## 掃引 CSV の解析
+
+`analyze_sweep_csv.py` は ASD-PD31 の解析スクリプトを KM003C 向けに移植した単独ファイルです。`sweep` / `load` の CSV を読み、ASD 側のフォルダは不要です。追加ライブラリを一度インストールして使います。
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/avs_sweep.csv --out captures/analysis/avs_sweep
+
+# 英語レポートだけにする。グラフ不要なら --no-plots。
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/avs_sweep.csv --lang en --no-plots
+```
+
+既定では `_normalized.csv`、`_summary.csv`、日本語の `_human_report.txt`、英語の `_human_report.en.txt` と、実測電圧・電圧誤差（V / %）・電流・電力の PNG 5 枚を生成します。`--out` 省略時は入力 CSV と同じフォルダ・同じ stem を使います。出力フォルダは自動作成し、同名の解析結果は上書きします。`--lang ja|en|both` で言語を選べます（既定 both）。グラフの軸・凡例は英語です。ASD と同様に `--no-report`、`--no-print`、`--modes avs|pps`、`--discard-first N` も使えます。先頭 N サンプルの除外は、各目標値・実行・往復区間ごとに適用します。
+
+取得時に `--continuous-sweep`、`--measure` または `--measure-loop` を指定してください。要求だけの CSV には解析する ADC 実測値がありません。失敗・中断の行と欠損・非有限の測定値を除外し、追記した別実行、PDO・要求電流の違い、往路・復路を別々に集計します。元の電流・電力の符号と要求・応答の生データを保持します。PD 要求電流を外部負荷の設定値で代用せず、ADC の測定値のばらつきをリップルとして扱いません。未取得のリップル・温度のグラフは生成しません。入力は掃引 CSV で、`capture` の PD / scope CSV とは別形式です。
 
 ## 構成と検証
 

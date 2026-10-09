@@ -82,11 +82,14 @@ python km003c_cli.py convert --input captures/session01.records.bin --infer-vbus
 
 The event time is the first sample after the threshold, with 1 ms device resolution and the polling interval's uncertainty (default 40 ms). It is a software estimate, not a KM003C hardware event; transitions between samples may be missed. Console lines are labeled `[VBUS inferred]`. Selected GUI outputs receive voltage-event rows (`Ok=VBUS_UP/DN`, Utility `VOLT_PKT` adapter), not fabricated PD messages. GUI rows alone cannot distinguish these estimates from hardware VBUS events: share `.vbus_events.jsonl` and metadata with them. The sidecar is always written when inference is enabled, even with `--formats original`, and records `estimated`, source, threshold, sample interval, and GUI row association. `vbus_event_inference` metadata records thresholds, counts, and gap resets; `gui_pd_messages` excludes estimates, while `gui_rows` includes them. Native frames, original JSONL, scope samples, and native PD counts are unchanged.
 
-### AVS transition analysis
+### SPR PPS / AVS transition analysis
 
 ```powershell
 # Capture until Ctrl+C with an automatic captures/km003c_<date/time> prefix.
 python km003c_cli.py capture --analyze-transitions
+
+# Capture with waveform, response/settling time and estimated slew plots.
+python km003c_cli.py capture --scope --analyze-transitions --transition-plots --out-prefix captures/pps_avs
 
 # Fixed-duration capture; VBUS UP/DN inference is independent and optional.
 python km003c_cli.py capture --seconds 10 --analyze-transitions --infer-vbus-events --out-prefix captures/avs01
@@ -96,9 +99,14 @@ python km003c_cli.py convert --input captures/avs01.records.bin --analyze-transi
 
 # CY4500-style analysis of the PD and scope CSV from the same KM003C capture.
 python km003c_cli.py analyze-sync --pd-csv captures/avs01.csv --scope-csv captures/avs01.scope.csv --out-prefix captures/avs_csv
+
+# Add the same plots when analyzing saved PD/scope files.
+python km003c_cli.py analyze-sync --pd-csv captures/avs01.csv --scope-csv captures/avs01.scope.csv --transition-plots --out-prefix captures/avs_plots
 ```
 
-`--analyze-transitions` is off by default, requires scope, and runs after capture ends (including Ctrl+C) or after offline conversion. It decodes only `EPR_REQUEST` with an RDO and selected EPR AVS PDO, matches subsequent SOP ACCEPT/PS_RDY before the next request, and estimates baseline, movement direction/start, target crossing, target-band settling, observed plateau, and average slew. Fixed/PPS/SPR-AVS requests are outside this analysis. An empty capture or one without AVS requests still produces reports with headers and a no-transitions message. Analysis works with every `--formats` selection, using temporary input files independent of saved GUI/native outputs. Original records and measurements are preserved. `analyze-sync` needs device-timestamped PD/scope files from the same capture; a standalone host-timed `scope` CSV cannot be correlated.
+`--analyze-transitions` is off by default, requires scope, and runs after capture ends (including Ctrl+C) or after offline conversion. It supports SPR PPS and SPR AVS `REQUEST`, and EPR AVS `EPR_REQUEST`. SPR requests are decoded using the selected PDO in the most recent SOP `SOURCE_CAPABILITIES`; start capture before capability exchange. Missing capabilities and unsupported/fixed requests are skipped with reason counts. EPR requests carry their selected PDO. Subsequent SOP ACCEPT/PS_RDY are matched until the next request or rejection/reset. Analysis estimates baseline, movement direction/start, target crossing, target-band settling, observed plateau, and average slew. An empty capture or one without programmable requests still produces reports with headers and a no-transitions message. Analysis works with every `--formats` selection, using temporary input files independent of saved GUI/native outputs. Original records and measurements are preserved. `analyze-sync` needs device-timestamped PD/scope files from the same capture; a standalone host-timed `scope` CSV cannot be correlated.
+
+Add `--transition-plots` to capture/conversion with analysis, or to `analyze-sync`, to generate `.transitions.png` (measured VBUS, requested targets and Request/ACCEPT/PS_RDY), `.transition_timing.png` (response and settling), and `.transition_slew.png` (estimated signed slew). Install `python -m pip install -r requirements-analysis.txt` first. Gaps break waveform connectors and missing timing/slew values are omitted. Reports include `request_mode`, `request_message` and `object_position`. Transition analysis needs paired PD/scope capture data; the separate sweep CSV analyzer cannot recover PD response timings from sweep measurements alone.
 
 Reports use CY4500's column names/order: `.transitions.csv`, `.transitions.txt`, `.transition_summary.csv`, and `.transition_summary.txt`. Capture/conversion metadata records the analysis settings, status, counts and request-index policy; standalone analyze-sync records settings in the text report. The human summary compares the requested target and measured plateau separately. CSV flags identify KM003C point timestamps, sampled waveforms, missing data, and interrupted/failed captures. The device resolution is 1 ms and default polling is 40 ms: reported latency/slew is an estimate, fast ramps may be missed, and the reports are not a physical USB-PD timing compliance test. No samples or clock offsets are invented. Long gaps/duplicate timestamps break sustained movement and settling; insufficient stable data leaves the plateau or settling fields empty. A nearest measurement more than the allowed sample gap from a request/PS_RDY is marked unavailable.
 
@@ -295,6 +303,22 @@ python km003c_cli.py --port COM14 --mode avs --sweep 15:48:1:5 --pdo-index 11 --
 Sweep CSV uses common ASD fields such as `target_voltage_v`, `request_current_a`, `actual_voltage_v`, `actual_current_a`, `sweep_leg`, and `sweep_pass`, plus KM command/response/status fields. Load targets remain blank. It is a **sweep-specific subset**, not the complete ASD CSV schema or the EZ-PD capture CSV format. Metadata is stored as `<CSV>.metadata.json`; append runs preserve previous metadata and add `<CSV>.run_<timestamp>.metadata.json`.
 
 Normal completion, Ctrl+C, and errors run `reset` then `pdm close` before closing host connections. `pdm close` alone was observed to leave the source at 24 V; an active 15 V AVS request was released to about 5.12 V in a subsequent reset/close test, with the external load drawing approximately 0 A. Each cleanup command has a 2 s reply window. A second Ctrl+C is deferred during cleanup, and the previous signal handler is restored afterward. Response bytes/errors are recorded separately in metadata `cleanup`; they do not replace the original sweep failure. A cleanup failure makes an otherwise completed run fail. When a measurement connection is available, one final ADC read checks voltage is at most 5.5 V; this observation stays in metadata rather than adding a sweep CSV row. Without an ADC connection, command acknowledgment is recorded without claiming measured voltage recovery. `--keep-trigger` explicitly retains the last request; default is off. **The external electronic load is not turned off or reconfigured.** Empty replies do not mean success: rows remain `sent_unverified`. Reply lines starting with error/failed/false/reject stop the sweep; other reply formats remain unverified. ADC readings describe held targets; use `capture` for PD transition waveform timing. **Live voltage sweeps and USB ADC access alongside CDC are not hardware-verified; CDC initialization/PDO queries alongside HID ADC have been verified.**
+
+## Sweep CSV analysis
+
+`analyze_sweep_csv.py` is a standalone adaptation of the ASD-PD31 analyzer. It reads the CSV produced by KM003C `sweep` / `load` and needs no ASD checkout. Install the optional analysis dependencies once:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-analysis.txt
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/avs_sweep.csv --out captures/analysis/avs_sweep
+
+# English report only; omit PNG plots if needed.
+.\.venv\Scripts\python.exe analyze_sweep_csv.py captures/avs_sweep.csv --lang en --no-plots
+```
+
+Default output is `_normalized.csv`, `_summary.csv`, `_human_report.txt` (Japanese), `_human_report.en.txt` (English), and five PNG plots: `_voltage_actual.png`, `_voltage_error.png`, `_voltage_error_pct.png`, `_current.png`, `_power.png`. Without `--out`, files are written alongside the input using its stem. Output directories are created automatically; analysis files with the same names are overwritten. `--lang ja|en|both` selects report languages (default: both). `--no-report`, `--no-print`, `--modes avs|pps`, and `--discard-first N` follow the ASD analyzer's usage; discard applies independently to each target/run/leg. PNG labels are English.
+
+Capture measurements using `--continuous-sweep`, `--measure`, or `--measure-loop`; a request-only CSV has no ADC readings to analyze. Failed/interrupted rows and nonfinite/missing measurements are excluded. Appended runs, PDOs, request currents, and outbound/return legs are kept separate. Original signed current/power and raw command evidence are preserved. PD request current is not substituted for the external load setting, and KM003C ADC variation is not presented as ripple. Unavailable ripple/temperature plots are omitted. This analyzer expects sweep CSV, not the PD/scope CSV produced by `capture`.
 
 ## Development and verification
 

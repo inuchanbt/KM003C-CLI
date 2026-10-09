@@ -48,6 +48,9 @@ TRANSITION_CSV_COLUMNS = (
     "observed_settling_latency_us",
     "observed_average_slew_V_per_s",
     "flags",
+    "request_mode",
+    "request_message",
+    "object_position",
 )
 
 def _transition_row(a: AVSTransitionAnalysis) -> dict[str, object]:
@@ -61,6 +64,9 @@ def _transition_row(a: AVSTransitionAnalysis) -> dict[str, object]:
 
 HUMAN_TRANSITION_SUMMARY_COLUMNS = (
     "transition",
+    "request_mode",
+    "request_message",
+    "object_position",
     "request_sno",
     "direction",
     "from_V",
@@ -149,6 +155,9 @@ def _human_summary_row(
 
     return {
         "transition": transition_no,
+        "request_mode": a.request_mode,
+        "request_message": a.request_message,
+        "object_position": a.object_position,
         "request_sno": a.request_sno,
         "direction": a.direction,
         "from_V": a.baseline_vbus_V,
@@ -198,11 +207,11 @@ def _write_human_transition_summary(
         writer.writerows(rows)
 
     lines = [
-        "KM003C AVS per-transition summary",
+        "KM003C PPS/AVS per-transition summary",
         "====================================",
         "",
         (
-            "T#  SNo  Dir    From -> Target   Plateau   Move     PS_RDY   "
+            "T#  SNo  Mode     Dir    From -> Target   Plateau   Move     PS_RDY   "
             "V@PS / Plateau   Obs.Set  PS->Obs   Obs.Slew   Abs"
         ),
         (
@@ -230,6 +239,7 @@ def _write_human_transition_summary(
         lines.append(
             f"{row['transition']:>2}  "
             f"{str(row['request_sno']):>3}  "
+            f"{row['request_mode']:<7}  "
             f"{row['direction']:<4}  "
             f"{from_to:<15}  "
             f"{_fmt_num(row['observed_plateau_V'], 3, 'V'):>8}  "
@@ -246,11 +256,12 @@ def _write_human_transition_summary(
         [
             "",
             "Column meanings:",
-            "  Move      = EPR_REQUEST -> sustained VBUS movement start",
-            "  PS_RDY    = EPR_REQUEST -> PS_RDY",
+            "  Mode      = SPR_PPS / SPR_AVS / EPR_AVS",
+            "  Move      = REQUEST / EPR_REQUEST -> sustained VBUS movement start",
+            "  PS_RDY    = REQUEST / EPR_REQUEST -> PS_RDY",
             "  V@PS      = measurement VBUS nearest PS_RDY",
             "  Plateau   = observed final plateau from stable measurement data",
-            "  Obs.Set   = EPR_REQUEST -> observed-plateau settle",
+            "  Obs.Set   = REQUEST / EPR_REQUEST -> observed-plateau settle",
             "  PS->Obs   = PS_RDY -> observed-plateau settle "
             "(negative means settled before PS_RDY)",
             "  Abs       = requested-target absolute settling result",
@@ -280,7 +291,7 @@ def _write_transition_outputs(
             writer.writerow(_transition_row(a))
 
     lines = [
-        "KM003C synchronized AVS transition analysis",
+        "KM003C synchronized PPS/AVS transition analysis",
         "==============================================",
         "Clock handling: native KM003C device milliseconds converted to microseconds;",
         "no host-time offset or fitted clock offset is applied.",
@@ -297,11 +308,13 @@ def _write_transition_outputs(
         lines.extend(
             [
                 (
-                    f"[{n}] SNo={a.request_sno} {a.direction} "
+                    f"[{n}] {a.supply_type} SNo={a.request_sno} {a.direction} "
                     f"target={a.target_voltage_V:.3f} V "
                     f"current={a.requested_current_A if a.requested_current_A is not None else 'n/a'} A"
                 ),
                 f"  Request          : {a.request_start_us} us",
+                f"  Message / PDO    : {a.request_message} / object {a.pdo_object_position}; selected PDO "
+                + (f"0x{a.selected_pdo:08X}" if a.selected_pdo is not None else 'unavailable'),
                 (
                     f"  ACCEPT           : {a.accept_start_us} us "
                     f"(+{a.accept_latency_us/1000:.3f} ms)"
@@ -412,9 +425,9 @@ def _write_transition_outputs(
 
 def _print_transition_analysis(analyses: list[AVSTransitionAnalysis]) -> None:
     print()
-    print("AVS TRANSITION ANALYSIS")
+    print("PPS/AVS TRANSITION ANALYSIS")
     if not analyses:
-        print("No AVS EPR_REQUEST transitions found.")
+        print("No decodable SPR PPS/AVS or EPR AVS transitions found.")
         return
 
     for a in analyses:
@@ -451,7 +464,7 @@ def _print_transition_analysis(analyses: list[AVSTransitionAnalysis]) -> None:
             if a.observed_average_slew_V_per_s is not None else "-"
         )
         print(
-            f"SNo={a.request_sno!s:>3} {a.direction:4s} "
+            f"{a.supply_type} SNo={a.request_sno!s:>3} {a.direction:4s} "
             f"target={a.target_voltage_V:6.3f}V "
             f"move={move:>10} PS_RDY={ps:>10} "
             f"V@PS={ps_v:>9} abs_settle={settle:>10} "

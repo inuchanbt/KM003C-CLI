@@ -6,8 +6,10 @@ import math
 from pathlib import Path
 import tempfile
 
-from .transition_analysis import SyncPDSample, SyncScopeSample, analyze_avs_transitions
+from .transition_analysis import (SyncPDSample, SyncScopeSample, analyze_avs_transitions,
+                                  decode_programmable_requests, RESET_MESSAGES)
 from .transition_report import TRANSITION_OUTPUT_SUFFIXES, _write_transition_outputs, _print_transition_analysis
+from .transition_plots import TRANSITION_PLOT_SUFFIXES, require_transition_plotting, write_transition_plots
 
 
 # Shared analysis thresholds follow CY4500; sample-dependent values suit 40 ms polling.
@@ -31,6 +33,8 @@ ANALYSIS_OPTIONS = (
 
 
 def add_analysis_options(parser, positive_float, nonnegative_float, positive_int):
+    parser.add_argument('--transition-plots', action='store_true',
+                        help='save waveform, timing and slew PNG plots (requires analysis and matplotlib)')
     for name, default, description in ANALYSIS_OPTIONS:
         kind = positive_int if isinstance(default, int) else (
             nonnegative_float if name in ('baseline-guard-ms', 'movement-mad-multiplier') else positive_float)
@@ -41,6 +45,10 @@ def add_analysis_options(parser, positive_float, nonnegative_float, positive_int
 def analysis_settings(args):
     return {name.replace('-', '_'): getattr(args, name.replace('-', '_'))
             for name, _, _ in ANALYSIS_OPTIONS}
+
+
+def analysis_output_suffixes(args):
+    return TRANSITION_OUTPUT_SUFFIXES + (TRANSITION_PLOT_SUFFIXES if getattr(args, 'transition_plots', False) else ())
 
 
 def run_analysis(pd, scope, args, *, capture_status='completed'):
@@ -59,6 +67,7 @@ def run_analysis(pd, scope, args, *, capture_status='completed'):
                    'plateau_stability_min_span_v': 'plateau_stability_min_span_V'}.get(name, name)
         parameters[key] = value
     analyses = analyze_avs_transitions(pd, scope, **parameters)
+    _, skipped = decode_programmable_requests(pd)
     # Keep point-time and sampling limits visible in the compatible flags column.
     marked = []
     ordered = sorted(scope, key=lambda s: s.timestamp_us)
@@ -72,8 +81,13 @@ def run_analysis(pd, scope, args, *, capture_status='completed'):
                     timestamp_policy='device ms converted to us; PD start/end are observed point times',
                     waveform_policy='native samples only; no interpolation; latency and slew are estimates',
                     max_observed_sample_gap_us=max(gaps, default=None),
-                    capture_status=capture_status)
+                    capture_status=capture_status, skipped_requests=skipped,
+                    protocol_counts={kind: sum(a.supply_type == kind for a in marked)
+                                     for kind in ('SPR_PPS', 'SPR_AVS', 'EPR_AVS')})
     prefix = Path(args.out_prefix).expanduser()
+    if getattr(args, 'transition_plots', False):
+        settings['plots'] = write_transition_plots(marked, pd, scope, prefix,
+            max_gap_us=parameters['settle_max_sample_gap_us'])
     _write_transition_outputs(marked, csv_path=prefix.with_suffix('.transitions.csv'),
                               summary_path=prefix.with_suffix('.transitions.txt'), settings=settings,
                               human_csv_path=prefix.with_suffix('.transition_summary.csv'),
@@ -81,10 +95,15 @@ def run_analysis(pd, scope, args, *, capture_status='completed'):
     return marked, settings
 
 
-def print_analysis_outputs(analyses, prefix):
+def print_analysis_outputs(analyses, prefix, settings=None):
     _print_transition_analysis(analyses)
     for suffix in TRANSITION_OUTPUT_SUFFIXES:
         print(f'Transition analysis: {Path(prefix).with_suffix(suffix).resolve()}')
+    if settings:
+        for path in settings.get('plots', []):
+            print(f'Transition plot: {path}')
+        if settings.get('skipped_requests'):
+            print(f'Skipped requests: {settings["skipped_requests"]}')
 
 
 class TransitionSession:
@@ -99,6 +118,10 @@ class TransitionSession:
 
     def event(self, event, index):
         # SOP'/SOP'' responses concern cables and must not satisfy power-contract matching.
+        if event.message in RESET_MESSAGES and event.header is None:
+            self.pd.write(json.dumps(dict(row_index=index-1, sno=index, message=event.message,
+                start_us=event.timestamp_us, end_us=event.timestamp_us, vbus_V=None, data='')) + '\n')
+            return
         if event.header is None or event.sop != 0:
             return
         self.pd.write(json.dumps(dict(row_index=index - 1, sno=index, message=event.message,
@@ -125,13 +148,16 @@ def load_analysis_csv(pd_path, scope_path):
         if not {'Sno', 'SOP', 'Message', 'Data', 'Start Time', 'End Time', 'Vbus(V)'} <= set(reader.fieldnames or []):
             raise ValueError('PD CSV is missing required Utility columns')
         for index, row in enumerate(reader):
-            if row['SOP'] != 'SOP' or row['Message'] not in ('EPR_REQUEST', 'ACCEPT', 'PS_RDY'):
+            reset = row['Message'] in RESET_MESSAGES and row['SOP'] in ('SOP', '', '-')
+            if not reset and (row['SOP'] != 'SOP' or row['Message'] not in (
+                    'SOURCE_CAPABILITIES', 'REQUEST', 'EPR_REQUEST', 'ACCEPT', 'PS_RDY',
+                    'REJECT', 'WAIT', 'NOT_SUPPORTED', 'SOFT_RESET')):
                 continue
             try:
                 words = (row['Data'] or '').split()
                 data = b''.join(int(word, 16).to_bytes(4, 'little') for word in words[1:])
                 pd.append(SyncPDSample(index, int(row['Sno']), row['Message'], int(row['Start Time']),
-                          int(row['End Time']), float(row['Vbus(V)']) / 1000, data))
+                          int(row['End Time']), float(row['Vbus(V)']) / 1000 if row['Vbus(V)'] else None, data))
             except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(f'Invalid PD CSV row {index + 2}: {exc}') from exc
     scope = []
@@ -145,5 +171,9 @@ def load_analysis_csv(pd_path, scope_path):
             timestamp, voltage = int(row['Timestamp(us)']), float(row['Vbus(V)'])
             if not math.isfinite(voltage):
                 raise ValueError('Scope voltage must be finite')
-            scope.append(SyncScopeSample(timestamp, voltage))
+            def optional_voltage(name):
+                value = row.get(name, '')
+                return float(value) if value not in ('', None) else None
+            scope.append(SyncScopeSample(timestamp, voltage, optional_voltage('Ibus(A)'),
+                                         optional_voltage('CC1(V)'), optional_voltage('CC2(V)')))
     return pd, scope

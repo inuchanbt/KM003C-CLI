@@ -1,0 +1,3 @@
+# Optional CSV analysis and PNG plots; hardware capture does not require these.
+pandas>=2.0
+matplotlib>=3.7

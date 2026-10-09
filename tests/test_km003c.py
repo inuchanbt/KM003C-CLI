@@ -386,6 +386,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(nodes), len(wanted))
         namespace = {'csv': csv, 'math': math, 'Path': Path, 'SyncPDSample': SimpleNamespace,
                      'SyncScopeSample': SimpleNamespace}
+        # Current CY4500 delegates PD loading to its USB-independent pd_capture module.
+        loader_path = Path(reference_root) / 'pd_capture.py'
+        if loader_path.is_file():
+            loader_source = loader_path.read_text(encoding='utf-8-sig')
+            loader_nodes = [n for n in ast.parse(loader_source).body if isinstance(n, ast.FunctionDef)]
+            loader_code = 'from __future__ import annotations\n' + '\n\n'.join(
+                ast.get_source_segment(loader_source, n) for n in loader_nodes)
+            exec(compile(loader_code, str(loader_path), 'exec'), namespace)
         code = 'from __future__ import annotations\n' + '\n\n'.join(ast.get_source_segment(source, n) for n in nodes)
         exec(compile(code, str(reference), 'exec'), namespace)
         with tempfile.TemporaryDirectory() as folder, cli.ExitStack() as stack:
