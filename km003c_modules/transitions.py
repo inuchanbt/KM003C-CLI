@@ -10,6 +10,7 @@ from .transition_analysis import (SyncPDSample, SyncScopeSample, analyze_avs_tra
                                   decode_programmable_requests, RESET_MESSAGES)
 from .transition_report import TRANSITION_OUTPUT_SUFFIXES, _write_transition_outputs, _print_transition_analysis
 from .transition_plots import TRANSITION_PLOT_SUFFIXES, require_transition_plotting, write_transition_plots
+from . import analysis_quality as quality
 
 
 # Shared analysis thresholds follow CY4500; sample-dependent values suit 40 ms polling.
@@ -48,7 +49,7 @@ def analysis_settings(args):
 
 
 def analysis_output_suffixes(args):
-    return TRANSITION_OUTPUT_SUFFIXES + (TRANSITION_PLOT_SUFFIXES if getattr(args, 'transition_plots', False) else ())
+    return TRANSITION_OUTPUT_SUFFIXES + ('.protocol_diagnostics.csv',) + (TRANSITION_PLOT_SUFFIXES if getattr(args, 'transition_plots', False) else ())
 
 
 def run_analysis(pd, scope, args, *, capture_status='completed'):
@@ -85,6 +86,22 @@ def run_analysis(pd, scope, args, *, capture_status='completed'):
                     protocol_counts={kind: sum(a.supply_type == kind for a in marked)
                                      for kind in ('SPR_PPS', 'SPR_AVS', 'EPR_AVS')})
     prefix = Path(args.out_prefix).expanduser()
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    wire = [dict(row_index=p.row_index, sno=p.sno, message=p.message, t=p.start_us,
+                 role=('SRC' if p.header & 256 else 'SNK') if p.header is not None else None,
+                 message_id=(p.header >> 9) & 7 if p.header is not None else None,
+                 objects=[int.from_bytes(p.data[i:i+4], 'little') for i in range(0, len(p.data), 4)]) for p in pd]
+    diagnostic_rows = quality.diagnostics(wire)
+    settings.update(quality.resolution([dict(t=s.timestamp_us) for s in ordered]))
+    settings['protocol_diagnostics_file'] = str(prefix.with_suffix('.protocol_diagnostics.csv'))
+    settings['protocol_diagnostic_counts'] = dict(requests=sum(d['event']=='request' for d in diagnostic_rows),
+        repeated_requests=sum(d.get('duplicate_classification','none')!='none' for d in diagnostic_rows),
+        resets=sum(d['event'] in quality.RESETS for d in diagnostic_rows))
+    keys = list(dict.fromkeys(k for r in diagnostic_rows for k in r)) or ['status']
+    with prefix.with_suffix('.protocol_diagnostics.csv').open('w', encoding='utf-8-sig', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(diagnostic_rows)
     if getattr(args, 'transition_plots', False):
         settings['plots'] = write_transition_plots(marked, pd, scope, prefix,
             max_gap_us=parameters['settle_max_sample_gap_us'])
@@ -92,12 +109,22 @@ def run_analysis(pd, scope, args, *, capture_status='completed'):
                               summary_path=prefix.with_suffix('.transitions.txt'), settings=settings,
                               human_csv_path=prefix.with_suffix('.transition_summary.csv'),
                               human_text_path=prefix.with_suffix('.transition_summary.txt'))
+    messages = ['\nProtocol diagnostics (reset sender does not establish root cause):']
+    for d in diagnostic_rows:
+        if d['event'] != 'request' or d['duplicate_classification'] != 'none' or d['protocol_status'] == 'failed':
+            messages.append(f"{d['event']} Sno={d['sno']} sender={d['sender']} ID={d.get('message_id')}; "
+                f"{d.get('duplicate_classification','')}; GoodCRC={d.get('goodcrc_status')}; "
+                f"previous ACK Sno={d.get('previous_goodcrc_sno')}; reset={d.get('reset_sender')}; "
+                f"{d['cause_classification']}: {d['cause_evidence']}")
+    for suffix in ('.transitions.txt', '.transition_summary.txt'):
+        with prefix.with_suffix(suffix).open('a', encoding='utf-8') as handle:
+            handle.write('\n'.join(messages)+'\n')
     return marked, settings
 
 
 def print_analysis_outputs(analyses, prefix, settings=None):
     _print_transition_analysis(analyses)
-    for suffix in TRANSITION_OUTPUT_SUFFIXES:
+    for suffix in TRANSITION_OUTPUT_SUFFIXES + ('.protocol_diagnostics.csv',):
         print(f'Transition analysis: {Path(prefix).with_suffix(suffix).resolve()}')
     if settings:
         for path in settings.get('plots', []):
@@ -125,6 +152,7 @@ class TransitionSession:
         if event.header is None or event.sop != 0:
             return
         self.pd.write(json.dumps(dict(row_index=index - 1, sno=index, message=event.message,
+                      header=event.header,
                       start_us=event.timestamp_us, end_us=event.timestamp_us,
                       vbus_V=event.vbus_mV / 1000,
                       data=bytes.fromhex(event.wire_hex)[2:2 + 4 * ((event.header >> 12) & 7)].hex())) + '\n')
@@ -149,15 +177,14 @@ def load_analysis_csv(pd_path, scope_path):
             raise ValueError('PD CSV is missing required Utility columns')
         for index, row in enumerate(reader):
             reset = row['Message'] in RESET_MESSAGES and row['SOP'] in ('SOP', '', '-')
-            if not reset and (row['SOP'] != 'SOP' or row['Message'] not in (
-                    'SOURCE_CAPABILITIES', 'REQUEST', 'EPR_REQUEST', 'ACCEPT', 'PS_RDY',
-                    'REJECT', 'WAIT', 'NOT_SUPPORTED', 'SOFT_RESET')):
+            if not reset and row['SOP'] != 'SOP':
                 continue
             try:
                 words = (row['Data'] or '').split()
-                data = b''.join(int(word, 16).to_bytes(4, 'little') for word in words[1:])
+                header = int(words[0], 16) if words else None
+                data = b'' if header is not None and header & 0x8000 else b''.join(int(word, 16).to_bytes(4, 'little') for word in words[1:])
                 pd.append(SyncPDSample(index, int(row['Sno']), row['Message'], int(row['Start Time']),
-                          int(row['End Time']), float(row['Vbus(V)']) / 1000 if row['Vbus(V)'] else None, data))
+                          int(row['End Time']), float(row['Vbus(V)']) / 1000 if row['Vbus(V)'] else None, data, header))
             except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(f'Invalid PD CSV row {index + 2}: {exc}') from exc
     scope = []

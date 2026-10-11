@@ -312,7 +312,7 @@ def normalize_header_csv(path: Path) -> Optional[pd.DataFrame]:
             normalized[canonical] = df[col]
 
     # Preserve metadata, condition, and merged thermocouple columns.
-    for col in META_COLS + CONDITION_COLS + EXTERNAL_TEMPERATURE_COLS:
+    for col in META_COLS + CONDITION_COLS + EXTERNAL_TEMPERATURE_COLS + ['pd_recording_key', 'pd_row_begin', 'pd_row_end']:
         if col in df.columns and col not in normalized.columns:
             normalized[col] = df[col]
 
@@ -581,7 +581,7 @@ def sweep_group_columns(df: pd.DataFrame, target_col: str) -> list[str]:
     """Keep appended runs, PDOs and outbound/return points independent."""
     columns = first_existing_cols(df, [target_col, "mode", "pdo_kind"])
     for col in ["run_started_at", "pdo_object_number", "request_current_a",
-                "sweep_leg", "sweep_pass", "sweep_direction"]:
+                "sweep_leg", "sweep_pass", "sweep_direction", "pdo_raw_u32", "target_load_current_a"]:
         if col in df.columns and df[col].notna().any() and col not in columns:
             columns.append(col)
     return columns
@@ -630,7 +630,7 @@ def build_summary(df: pd.DataFrame) -> pd.DataFrame:
             "module_temp_max_c": ("condition_module_temp_c", "max"),
         })
 
-    for col in META_COLS:
+    for col in list(META_COLS) + ["pd_recording_key", "pd_row_begin", "pd_row_end", "pdo_raw_u32"]:
         if col in df.columns:
             if col in group_cols:
                 continue
@@ -1100,6 +1100,9 @@ def build_human_report(df_all: pd.DataFrame, df: pd.DataFrame, summary: pd.DataF
             if axis["kind"] == "time"
             else "このCSVでは、rippleの急激な境界は目立ちません。"
         )
+    if getattr(args, 'quality_result', None):
+        from km003c_modules.analysis_quality import report as quality_report
+        lines.insert(2, quality_report(args.quality_result, 'ja'))
     return "\n".join(lines)
 
 
@@ -1173,6 +1176,9 @@ def build_english_report(df_all: pd.DataFrame, df: pd.DataFrame, summary: pd.Dat
               '- *_human_report.txt / *_human_report.en.txt: Japanese / English report.']
     if getattr(args, 'no_plots', False):
         lines.append('- PNG plots were disabled for this analysis.')
+    if getattr(args, 'quality_result', None):
+        from km003c_modules.analysis_quality import report as quality_report
+        lines.insert(2, quality_report(args.quality_result, 'en'))
     return '\n'.join(lines) + '\n'
 
 
@@ -1238,6 +1244,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=f"Analyze KM003C Sweep CSV {__version__} (ASD-style reports and plots)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("csv", help="Input sweep CSV")
+    parser.add_argument("--pd-csv", help="PD CSV from the same recording (including GoodCRC)")
+    parser.add_argument("--scope-csv", help="Native scope CSV from the same recording")
     parser.add_argument("--out", default=None, help="Output prefix. Default: input filename stem")
     parser.add_argument("--discard-first", type=int, default=0, help="Discard first N samples per target in each run/leg")
     parser.add_argument("--phase", choices=["measurement", "all", "helper", "precondition", "settle", "measurement-settle"], default="measurement", help="Which phase to analyze. Default: measurement only")
@@ -1250,6 +1258,8 @@ def main() -> int:
     parser.add_argument('--report-language', '--lang', choices=['ja', 'en', 'both'], default='both',
                         help='Report language (default: both; Japanese .txt and English .en.txt)')
     args = parser.parse_args()
+    if args.scope_csv and not args.pd_csv:
+        parser.error("--scope-csv requires --pd-csv")
     if args.discard_first < 0:
         parser.error('--discard-first must be nonnegative')
 
@@ -1269,6 +1279,10 @@ def main() -> int:
             return 1
 
         summary = build_summary(df)
+        from km003c_modules import analysis_quality as quality
+        quality_result = quality.integrate(summary, args.pd_csv, args.scope_csv)
+        args.quality_result = quality_result
+        summary = pd.DataFrame(quality_result['summary'])
         boundary = detect_ripple_boundary(summary)
 
         out_prefix = Path(args.out) if args.out else path.with_suffix("")
@@ -1278,6 +1292,8 @@ def main() -> int:
 
         df.to_csv(normalized_csv, index=False, encoding="utf-8-sig")
         summary.to_csv(summary_csv, index=False, encoding="utf-8-sig")
+        quality.write_outputs(quality_result, out_prefix, plots=not args.no_plots)
+        print(quality.report(quality_result, "en"))
 
         print(f"Loaded rows: {len(df_all)}")
         print(f"Analyzed rows: {len(df)}")

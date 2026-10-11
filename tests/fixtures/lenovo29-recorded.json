@@ -1,0 +1,47 @@
+{
+  "provenance": "Recorded Lenovo ADL240WY3AA-D ZIP 29 V summaries. Paired raw PD/scope supplied separately are a different recording; no PD events reconstructed.",
+  "points": [
+    {
+      "run_started_at": "2026-10-11T09:59:52.021Z",
+      "mode": "avs-sweep",
+      "pdo_kind": "EPR AVS",
+      "pdo_raw_u32": "0xd3c096f0",
+      "pdo_object_number": 11.0,
+      "target_voltage_v": 29.0,
+      "request_current_a": 5.0,
+      "sweep_leg": "outbound",
+      "sweep_pass": 1.0,
+      "sweep_axis": "voltage",
+      "first_row_number": 15.0,
+      "voltage_mean": 28.157878,
+      "pd_status": "unconfirmed",
+      "accept_ms": 4.0,
+      "ps_rdy_ms": null,
+      "transition_flags": "ended_by_soft_reset;movement_not_detected;direction_from_target_fallback;target_crossing_not_observed;target_band_not_reached;observed_plateau_not_found;km003c_point_timestamps;km003c_sampled_waveform",
+      "pd_recording_key": "4346409000:0x5DA1 0x881912C 0x2D12C 0x4B12C 0x641CC 0xE004B1CC",
+      "pd_row_begin": 633.0,
+      "pd_row_end": 665.0
+    },
+    {
+      "run_started_at": "2026-10-11T09:59:52.021Z",
+      "mode": "avs-sweep",
+      "pdo_kind": "EPR AVS",
+      "pdo_raw_u32": "0xd3c096f0",
+      "pdo_object_number": 11.0,
+      "target_voltage_v": 29.0,
+      "request_current_a": 5.0,
+      "sweep_leg": "return",
+      "sweep_pass": 2.0,
+      "sweep_axis": "voltage",
+      "first_row_number": 53.0,
+      "voltage_mean": 29.155386,
+      "pd_status": "confirmed",
+      "accept_ms": 4.0,
+      "ps_rdy_ms": 29.0,
+      "transition_flags": "target_crossing_not_observed;km003c_point_timestamps;km003c_sampled_waveform",
+      "pd_recording_key": "4346409000:0x5DA1 0x881912C 0x2D12C 0x4B12C 0x641CC 0xE004B1CC",
+      "pd_row_begin": 1641.0,
+      "pd_row_end": 1669.0
+    }
+  ]
+}

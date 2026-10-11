@@ -179,7 +179,7 @@ class SweepAnalysisTests(unittest.TestCase):
             path=self.write_csv(root,rows);prefix=Path(root)/'plots'
             result,output=self.run_analysis(path,'--out',prefix)
             self.assertEqual(result,0,output)
-            self.assertEqual(len(list(Path(root).glob('plots*.png'))),5)
+            self.assertEqual(len(list(Path(root).glob('plots*.png'))),6)
             self.assertFalse(Path(f'{prefix}_ripple.png').exists())
             frame=analyzer.load_and_normalize(path);summary=analyzer.build_summary(frame)
             counts=[]

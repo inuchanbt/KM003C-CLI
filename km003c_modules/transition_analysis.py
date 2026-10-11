@@ -35,6 +35,7 @@ class SyncPDSample:
     end_us: int
     vbus_V: Optional[float]
     data: bytes
+    header: Optional[int] = None
 
 
 @dataclass(frozen=True)
