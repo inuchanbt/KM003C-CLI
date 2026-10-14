@@ -361,3 +361,20 @@ $env:ASD_PD31_CLI_ROOT = 'D:\ASD-PD31\src\current'
 Java シリアライズ形式は MIT ライセンスの [CY4500 CLI](https://github.com/inuchanbt/cy4500-cli) と同系列の TI CLI に基づきます。メーカーのクラスはローカルでの互換性検証にだけ使い、配布しません。
 
 AVS 遷移解析・レポート形式は MIT ライセンスの CY4500 CLI（copyright 2026 inuchanbt）に基づき、KM003C の時刻・測定頻度と、測定の空きを考慮する判定へ適応しています。
+
+## ケーブル情報（SOP’）
+
+接続欄の **ケーブル情報を取得** を押します。USBを選択した後、もう一度押して同じKM003CのSerialを選択します。ケーブル模擬をOFF（`em=0`）にしてSPR PDを初期化し、SOP’ Discover Identity（PD3 / SVDM2、未応答時はPD2）を送信します。停止・失敗時も `reset` → `pdm close` を試みます。外部負荷はOFFにしてください。対象のケーブル経路にVCONN給電が必要で、接続状態やファームウェアによっては取得できません。
+
+VID/PID、XID、bcdDevice、Passive / Active、電流定格、最大VBUS電圧、EPR対応の申告、USB速度、生VDOを表示し、JSONとUSB生ログを保存できます。読み込んだPDログのSOP’応答も解析します。予約値や未知形式は不明のまま表示します。EPRフラグのデコードはPassiveのPD3 VDOに対応し、Activeや旧形式は生VDOを保持してEPR不明と表示します。応答なし・NAK・BUSY・不完全な応答を区別します。表示はケーブルの申告値であり、負荷試験や認証結果ではありません。
+
+更新したKM003C-CLIでは次を実行できます。
+```powershell
+python D:\KM003C\km003c_cli.py cable --port COM3 --json-file cable.json
+python D:\KM003C\km003c_cli.py cable --dry-run
+```
+旧CLIにも接続セット付属のアダプターで対応します。
+```powershell
+python km003c/cable_cli.py D:\KM003C\km003c_cli.py --port COM3 --json-file cable.json
+```
+`--serial` でUSBとCDCの機器を揃えます。既存JSONの上書きは `--force` 指定時だけです。ローカルCLI画面もこのアダプターを使い、操作の排他と停止を維持します。

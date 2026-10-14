@@ -30,6 +30,7 @@ from km003c_modules.transitions import (TransitionSession, analysis_output_suffi
 from km003c_modules.sweep import add_sweep_options, validate_sweep, run_sweep as execute_sweep
 
 from km003c_modules.pdo import add_pdo_options, run_pdo
+from km003c_modules.cable import add_cable_options
 
 VERSION = '0.5.5'
 
@@ -211,6 +212,9 @@ def build_arg_parser():
     p = sub.add_parser('sweep', aliases=['load'], help='ASD-style PPS/AVS voltage sweep')
     add_sweep_options(p, connection_options, positive_float, nonnegative_float, positive_int, nonnegative_int)
     p.set_defaults(func=run_sweep)
+
+    p = sub.add_parser('cable', help="read cable SOP' Discover Identity with USB + CDC")
+    add_cable_options(p, connection_options, positive_float)
 
     p = sub.add_parser('pdo', help='initialize PD and query source PDOs in one CDC session')
     add_pdo_options(p, connection_options, positive_float, nonnegative_float)

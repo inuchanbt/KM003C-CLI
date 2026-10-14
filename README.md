@@ -362,3 +362,20 @@ Implementation references include manufacturer interface/CDC/PDM documentation a
 The Java serialization schema is shared with the MIT-licensed [CY4500 CLI](https://github.com/inuchanbt/cy4500-cli) and sibling TI CLI. Manufacturer classes are used only for local compatibility verification and are not distributed.
 
 AVS transition analysis and report layouts are adapted from the MIT-licensed CY4500 CLI (copyright 2026 inuchanbt), with KM003C clock/sampling adaptations and conservative gap handling.
+
+## Cable identity (SOP’)
+
+Click **Read cable identity** in the connection panel. Select USB, then click again to select Serial on the same KM003C. The query disables cable emulation (`em=0`), enters SPR PD, sends SOP’ Discover Identity (PD3 / SVDM2, with PD2 fallback), and always attempts `reset` → `pdm close`. Turn off the external load. The selected cable path must have VCONN power; reception depends on the connection and firmware.
+
+The panel displays VID/PID, XID, bcdDevice, passive/active type, current rating, maximum VBUS voltage, EPR advertisement, USB speed and raw VDOs. Reserved/unknown layouts stay unknown. EPR is decoded for passive PD3 cable VDOs; active/legacy layouts retain raw VDOs and show unknown EPR. No reply, NAK, BUSY and incomplete identity are separate states. These are cable claims, not a load test or certification. USB logs and imported PD logs are decoded too; save JSON to retain the evidence.
+
+CLI (updated KM003C-CLI):
+```powershell
+python D:\KM003C\km003c_cli.py cable --port COM3 --json-file cable.json
+python D:\KM003C\km003c_cli.py cable --dry-run
+```
+The PowerChecker kit also works with an older CLI through the included adapter:
+```powershell
+python km003c/cable_cli.py D:\KM003C\km003c_cli.py --port COM3 --json-file cable.json
+```
+`--serial` selects the same device for USB and CDC. `--json-file` refuses existing files unless `--force` is supplied. The bridge calls this adapter, and keeps its one-operation-at-a-time and stop behavior.
